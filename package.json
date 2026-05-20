@@ -6,6 +6,7 @@
   "scripts": {
     "build": "pnpm build:wasm && pnpm --filter @syncplayer/web build",
     "build:wasm": "PATH=\"$HOME/.cargo/bin:$PATH\" wasm-pack build crates/sync-core --target web --out-dir pkg",
+    "build:vercel": "pnpm --filter @syncplayer/web build && node scripts/prepare-vercel-output.mjs",
     "build:web": "pnpm --filter @syncplayer/web build",
     "dev": "pnpm build:wasm && pnpm --filter @syncplayer/web dev",
     "dev:https": "pnpm build:wasm && pnpm --filter @syncplayer/web dev:https",

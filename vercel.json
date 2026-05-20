@@ -1,6 +1,6 @@
 {
-  "buildCommand": "pnpm --filter @syncplayer/web build",
+  "buildCommand": "pnpm run build:vercel",
   "installCommand": "pnpm install --frozen-lockfile",
-  "outputDirectory": "apps/web/dist",
+  "outputDirectory": "dist",
   "framework": "vite"
 }
