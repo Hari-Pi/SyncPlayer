@@ -43,20 +43,27 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
 
   const peerId = useMemo(() => `SP-${crypto.randomUUID().slice(0, 8).toUpperCase()}`, []);
   
+  // Store callbacks in refs so data listeners always invoke the latest version
+  // without needing to close over them (avoids stale closure on media state changes).
+  const onPlaybackStateRef = useRef(onPlaybackState);
+  const onEventRef = useRef(onEvent);
+  useEffect(() => { onPlaybackStateRef.current = onPlaybackState; }, [onPlaybackState]);
+  useEffect(() => { onEventRef.current = onEvent; }, [onEvent]);
+
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<DataConnection[]>([]);
   const pingRef = useRef<{ id: string; at: number } | null>(null);
 
   const closeRoom = useCallback(() => {
-    onEvent("info", "ROOM", "Initiating room closure. Terminating all peer connections.");
+    onEventRef.current("info", "ROOM", "Initiating room closure. Terminating all peer connections.");
     connectionsRef.current.forEach((conn) => {
-      onEvent("info", "WEBRTC", `Closing connection to peer: ${conn.peer}`);
+      onEventRef.current("info", "WEBRTC", `Closing connection to peer: ${conn.peer}`);
       conn.close();
     });
     connectionsRef.current = [];
     
     if (peerRef.current) {
-      onEvent("info", "PEERJS", "Destroying PeerJS instance and signaling socket.");
+      onEventRef.current("info", "PEERJS", "Destroying PeerJS instance and signaling socket.");
       peerRef.current.destroy();
       peerRef.current = null;
     }
@@ -67,7 +74,7 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
     setConnectedPeers([]);
     setLocalOffer("");
     setLocalAnswer("");
-  }, [onEvent]);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -107,6 +114,9 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
     [send]
   );
 
+  const latencyMsRef = useRef(latencyMs);
+  useEffect(() => { latencyMsRef.current = latencyMs; }, [latencyMs]);
+
   const handleMessage = useCallback(
     (conn: DataConnection, eventData: unknown) => {
       setMessagesReceived((count) => count + 1);
@@ -114,12 +124,12 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
 
       if (message.type === "room.hello") {
         setRemotePeer((prev) => prev === "Awaiting peer" ? message.payload.label : `${prev}, ${message.payload.label}`);
-        onEvent("ok", "PEER LINK", `${message.payload.label} (${conn.peer}) successfully negotiated handshake.`);
+        onEventRef.current("ok", "PEER LINK", `${message.payload.label} (${conn.peer}) successfully negotiated handshake.`);
         return;
       }
 
       if (message.type === "playback.state") {
-        onPlaybackState(message.payload, latencyMs);
+        onPlaybackStateRef.current(message.payload, latencyMsRef.current);
         return;
       }
 
@@ -142,7 +152,7 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
         pingRef.current = null;
       }
     },
-    [latencyMs, onEvent, onPlaybackState]
+    [] // stable: reads latest callbacks/latency via refs, no deps needed
   );
 
   const createHostOffer = useCallback(async () => {
@@ -158,17 +168,17 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
     peerRef.current = peer;
 
     peer.on("open", (id) => {
-      onEvent("ok", "PEERJS", `Successfully connected to signaling broker. Room ID: ${id}`);
+      onEventRef.current("ok", "PEERJS", `Successfully connected to signaling broker. Room ID: ${id}`);
     });
 
     peer.on("connection", (conn) => {
-      onEvent("info", "WEBRTC", `Incoming connection handshake from peer: ${conn.peer}`);
+      onEventRef.current("info", "WEBRTC", `Incoming connection handshake from peer: ${conn.peer}`);
 
       conn.on("open", () => {
         connectionsRef.current.push(conn);
         setConnectedPeers((prev) => [...prev, conn.peer]);
         setStatus("connected");
-        onEvent("ok", "WEBRTC", `Connection established with peer ${conn.peer}. ICE connection successful.`);
+        onEventRef.current("ok", "WEBRTC", `Connection established with peer ${conn.peer}. ICE connection successful.`);
         
         conn.send({
           id: crypto.randomUUID(),
@@ -188,7 +198,7 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
       conn.on("close", () => {
         connectionsRef.current = connectionsRef.current.filter((c) => c !== conn);
         setConnectedPeers((prev) => prev.filter((id) => id !== conn.peer));
-        onEvent("warn", "WEBRTC", `Viewer ${conn.peer} closed their connection channel.`);
+        onEventRef.current("warn", "WEBRTC", `Viewer ${conn.peer} closed their connection channel.`);
         if (connectionsRef.current.length === 0) {
           setStatus("disconnected");
           setRemotePeer("Awaiting peer");
@@ -196,24 +206,24 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
       });
 
       conn.on("error", (err) => {
-        onEvent("error", "WEBRTC", `WebRTC error with viewer ${conn.peer}: ${err.message}`);
+        onEventRef.current("error", "WEBRTC", `WebRTC error with viewer ${conn.peer}: ${err.message}`);
       });
     });
 
     peer.on("error", (err) => {
-      onEvent("error", "PEERJS", `Host broker socket error: ${err.message}`);
+      onEventRef.current("error", "PEERJS", `Host broker socket error: ${err.message}`);
       setStatus("failed");
     });
 
     return peerId;
-  }, [closeRoom, handleMessage, onEvent, peerId]);
+  }, [closeRoom, handleMessage, peerId]);
 
   const acceptGuestAnswer = useCallback(
     async (answerSignal: string) => {
       // Manual response links are fully deprecated. No-op for backwards compatibility.
-      onEvent("info", "ROOM", "Manual signaling is deprecated. Connections now occur automatically.");
+      onEventRef.current("info", "ROOM", "Manual signaling is deprecated. Connections now occur automatically.");
     },
-    [onEvent]
+    []
   );
 
   const joinWithOffer = useCallback(
@@ -232,15 +242,15 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
       peerRef.current = peer;
 
       peer.on("open", (id) => {
-        onEvent("ok", "PEERJS", `Successfully connected to signaling broker. Guest ID: ${id}`);
-        onEvent("info", "WEBRTC", `Negotiating WebRTC handshake with room host: ${hostId}`);
+        onEventRef.current("ok", "PEERJS", `Successfully connected to signaling broker. Guest ID: ${id}`);
+        onEventRef.current("info", "WEBRTC", `Negotiating WebRTC handshake with room host: ${hostId}`);
         const conn = peer.connect(hostId);
 
         conn.on("open", () => {
           connectionsRef.current.push(conn);
           setConnectedPeers([hostId]);
           setStatus("connected");
-          onEvent("ok", "WEBRTC", `Successfully joined room. Data channel is open with host.`);
+          onEventRef.current("ok", "WEBRTC", `Successfully joined room. Data channel is open with host.`);
 
           conn.send({
             id: crypto.randomUUID(),
@@ -262,23 +272,23 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
           setConnectedPeers([]);
           setStatus("disconnected");
           setRemotePeer("Awaiting peer");
-          onEvent("warn", "WEBRTC", `Room host (${hostId}) disconnected.`);
+          onEventRef.current("warn", "WEBRTC", `Room host (${hostId}) disconnected.`);
         });
 
         conn.on("error", (err) => {
-          onEvent("error", "WEBRTC", `WebRTC data channel error: ${err.message}`);
+          onEventRef.current("error", "WEBRTC", `WebRTC data channel error: ${err.message}`);
           setStatus("failed");
         });
       });
 
       peer.on("error", (err) => {
-        onEvent("error", "PEERJS", `Guest broker socket error: ${err.message}`);
+        onEventRef.current("error", "PEERJS", `Guest broker socket error: ${err.message}`);
         setStatus("failed");
       });
 
       return "";
     },
-    [closeRoom, handleMessage, onEvent]
+    [closeRoom, handleMessage]
   );
 
   const pingPeer = useCallback(() => {

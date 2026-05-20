@@ -141,6 +141,10 @@ export function App() {
   const lastBroadcastRef = useRef(0);
   const [clock, setClock] = useState(formatClock());
   const [media, setMedia] = useState<LoadedMedia | null>(null);
+  // Keep a ref to the live media so async callbacks always see the current value,
+  // not a stale closure from when the callback was last created.
+  const mediaStateRef = useRef<LoadedMedia | null>(null);
+  useEffect(() => { mediaStateRef.current = media; }, [media]);
   const [remoteUrl, setRemoteUrl] = useState("");
   const [inviteLink, setInviteLink] = useState("");
   const [responseLink, setResponseLink] = useState("");
@@ -175,9 +179,19 @@ export function App() {
   const handleRemotePlayback = useCallback(
     async (remoteSnapshot: PlaybackSnapshot, latencyMs: number) => {
       const element = mediaRef.current;
+      const currentMedia = mediaStateRef.current;
 
-      if (!element || !media || remoteSnapshot.mediaId !== media.id) {
-        log("warn", "SYNC", "Remote playback state received for different media.");
+      if (!element || !currentMedia) {
+        log("warn", "SYNC", `No media element or media mounted yet. Skipping remote state.`);
+        return;
+      }
+
+      if (remoteSnapshot.mediaId !== null && remoteSnapshot.mediaId !== currentMedia.id) {
+        log(
+          "warn",
+          "SYNC",
+          `Media ID mismatch — host: "${remoteSnapshot.mediaId}", local: "${currentMedia.id}". Load the same media as the host.`
+        );
         return;
       }
 
@@ -209,7 +223,7 @@ export function App() {
         remoteApplyRef.current = false;
       }, 250);
     },
-    [log, media]
+    [log] // stable: reads live media via mediaStateRef, not the closed-over state
   );
 
   const room = usePeerRoom({
