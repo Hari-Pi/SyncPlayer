@@ -41,12 +41,59 @@ function getPeerServerConfig() {
   return null; // null → PeerJS uses 0.peerjs.com by default
 }
 
+function createPeer(peerId: string) {
+  const serverConfig = getPeerServerConfig();
+  return new Peer(peerId, {
+    ...serverConfig,
+    config: rtcConfig,
+    debug: 2
+  });
+}
+
+function describeConnectionError(error: { type?: string; message?: string }) {
+  if (error.type === "negotiation-failed") {
+    return `${error.message ?? "Negotiation failed"} ICE could not find a working route. Keep the host tab open, use HTTPS for LAN/mobile, and retry after VPN/firewall changes.`;
+  }
+
+  if (error.type === "peer-unavailable") {
+    return `${error.message ?? "Peer unavailable"} The host room is not registered on the signaling broker yet or was closed.`;
+  }
+
+  return error.message ?? "Unknown WebRTC error.";
+}
+
+function waitForPeerOpen(peer: Peer, timeoutMs = 10000) {
+  return new Promise<string>((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      reject(new Error("Timed out waiting for PeerJS signaling broker."));
+    }, timeoutMs);
+
+    peer.once("open", (id) => {
+      window.clearTimeout(timeout);
+      resolve(id);
+    });
+
+    peer.once("error", (error) => {
+      window.clearTimeout(timeout);
+      reject(error);
+    });
+  });
+}
+
 const rtcConfig: RTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     { urls: "stun:stun2.l.google.com:19302" },
     { urls: "stun:stun.services.mozilla.com" },
+    {
+      urls: [
+        "turn:eu-0.turn.peerjs.com:3478",
+        "turn:us-0.turn.peerjs.com:3478"
+      ],
+      username: "peerjs",
+      credential: "peerjsp"
+    },
     {
       urls: [
         "turn:openrelay.metered.ca:80",
@@ -56,7 +103,8 @@ const rtcConfig: RTCConfiguration = {
       username: "openrelayproject",
       credential: "openrelayproject"
     }
-  ]
+  ],
+  iceCandidatePoolSize: 10
 };
 
 // 64 KB chunks — optimal for WebRTC DataChannel throughput
@@ -409,11 +457,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
 
     onEventRef.current("info", "PEERJS", `Initializing room owner node. Host Peer ID: ${peerId}`);
 
-    const serverConfig = getPeerServerConfig();
-    const peer = serverConfig
-      ? new Peer(peerId, { ...serverConfig, config: rtcConfig })
-      : new Peer(peerId, { config: rtcConfig });
-
+    const peer = createPeer(peerId);
     peerRef.current = peer;
 
     peer.on("open", (id) => {
@@ -439,6 +483,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
 
       conn.on("data", (data) => { handleMessage(conn, data); });
 
+      conn.on("iceStateChanged", (state) => {
+        const level = state === "failed" ? "error" : state === "disconnected" ? "warn" : "info";
+        onEventRef.current(level, "ICE", `Viewer ${conn.peer} ICE state: ${state}.`);
+      });
+
       conn.on("close", () => {
         connectionsRef.current = connectionsRef.current.filter((c) => c !== conn);
         setConnectedPeers((prev) => prev.filter((id) => id !== conn.peer));
@@ -450,14 +499,22 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
       });
 
       conn.on("error", (err) => {
-        onEventRef.current("error", "WEBRTC", `WebRTC error with ${conn.peer}: ${err.message}`);
+        onEventRef.current("error", "WEBRTC", `WebRTC error with ${conn.peer}: ${describeConnectionError(err)}`);
       });
     });
 
     peer.on("error", (err) => {
-      onEventRef.current("error", "PEERJS", `Host broker error: ${err.message}`);
+      onEventRef.current("error", "PEERJS", `Host broker error: ${describeConnectionError(err)}`);
       setStatus("failed");
     });
+
+    try {
+      await waitForPeerOpen(peer);
+    } catch (err) {
+      setStatus("failed");
+      onEventRef.current("error", "PEERJS", `Could not start host room: ${err instanceof Error ? describeConnectionError(err) : "unknown error"}`);
+      return "";
+    }
 
     return peerId;
   }, [closeRoom, handleMessage, peerId]);
@@ -478,11 +535,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
       onEventRef.current("info", "PEERJS", `Initializing guest node. Guest ID: ${guestId}`);
       onEventRef.current("info", "WEBRTC", `Connecting to room: ${hostId}`);
 
-      const serverConfig = getPeerServerConfig();
-      const peer = serverConfig
-        ? new Peer(guestId, { ...serverConfig, config: rtcConfig })
-        : new Peer(guestId, { config: rtcConfig });
-
+      const peer = createPeer(guestId);
       peerRef.current = peer;
 
       peer.on("open", (id) => {
@@ -506,6 +559,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
 
         conn.on("data", (data) => { handleMessage(conn, data); });
 
+        conn.on("iceStateChanged", (state) => {
+          const level = state === "failed" ? "error" : state === "disconnected" ? "warn" : "info";
+          onEventRef.current(level, "ICE", `Host ${hostId} ICE state: ${state}.`);
+        });
+
         conn.on("close", () => {
           connectionsRef.current = [];
           setConnectedPeers([]);
@@ -515,13 +573,13 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
         });
 
         conn.on("error", (err) => {
-          onEventRef.current("error", "WEBRTC", `Data channel error: ${err.message}`);
+          onEventRef.current("error", "WEBRTC", `Data channel error: ${describeConnectionError(err)}`);
           setStatus("failed");
         });
       });
 
       peer.on("error", (err) => {
-        onEventRef.current("error", "PEERJS", `Guest broker error: ${err.message}`);
+        onEventRef.current("error", "PEERJS", `Guest broker error: ${describeConnectionError(err)}`);
         setStatus("failed");
       });
 
