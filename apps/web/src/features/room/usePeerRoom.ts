@@ -5,6 +5,8 @@ import { smoothLatencySync } from "@/lib/wasm/syncCore";
 
 type RoomRole = "solo" | "host" | "guest";
 type LinkStatus = "idle" | "pairing" | "connected" | "disconnected" | "failed";
+type ExtendedRTCConfiguration = RTCConfiguration & { sdpSemantics?: "unified-plan" };
+type StoredPeerOptions = PeerJSOption & { config?: ExtendedRTCConfiguration };
 
 export type FileStreamHandlers = {
   onChunk: (index: number, total: number, data: Uint8Array, checksum: string) => void;
@@ -32,20 +34,50 @@ type PeerRoomOptions = {
   onFileStream?: (meta: FileMeta) => FileStreamHandlers;
 };
 
-// ─── Default PeerJS server (overridable via localStorage) ────────────────────
-function getPeerServerConfig() {
+function readStoredPeerOptions() {
   try {
     const stored = localStorage.getItem("syncplayer:peerserver");
-    if (stored) return JSON.parse(stored) as PeerJSOption;
+    if (stored) return JSON.parse(stored) as StoredPeerOptions;
   } catch { /* ignore */ }
-  return null; // null → PeerJS uses 0.peerjs.com by default
+  return null;
 }
 
-function createPeer(peerId: string) {
+// ─── Default PeerJS server (overridable via localStorage) ────────────────────
+function getPeerServerConfig() {
+  const stored = readStoredPeerOptions();
+  if (!stored) return null; // null → PeerJS uses 0.peerjs.com by default
+
+  const { config: _config, ...peerOptions } = stored;
+  return peerOptions;
+}
+
+function getCustomRtcConfig() {
+  try {
+    const stored = localStorage.getItem("syncplayer:rtcconfig");
+    if (stored) return JSON.parse(stored) as ExtendedRTCConfiguration;
+  } catch { /* ignore */ }
+
+  return readStoredPeerOptions()?.config ?? null;
+}
+
+function createRtcConfig(relayOnly = false): ExtendedRTCConfiguration {
+  const customConfig = getCustomRtcConfig();
+  const customIceServers = customConfig?.iceServers ?? [];
+
+  return {
+    ...rtcConfig,
+    ...customConfig,
+    iceServers: [...(rtcConfig.iceServers ?? []), ...customIceServers],
+    iceTransportPolicy: relayOnly ? "relay" : customConfig?.iceTransportPolicy ?? rtcConfig.iceTransportPolicy,
+    sdpSemantics: "unified-plan"
+  };
+}
+
+function createPeer(peerId: string, relayOnly = false) {
   const serverConfig = getPeerServerConfig();
   return new Peer(peerId, {
     ...serverConfig,
-    config: rtcConfig,
+    config: createRtcConfig(relayOnly),
     debug: 2
   });
 }
@@ -80,12 +112,67 @@ function waitForPeerOpen(peer: Peer, timeoutMs = 10000) {
   });
 }
 
-const rtcConfig: RTCConfiguration = {
+function getCandidateType(candidate: string) {
+  return / typ (host|srflx|prflx|relay)(?: |$)/.exec(candidate)?.[1] ?? "unknown";
+}
+
+function setupConnectionDiagnostics(
+  conn: DataConnection,
+  peerLabel: string,
+  onEvent: (level: "info" | "ok" | "warn" | "error", label: string, detail: string) => void
+) {
+  const pc = conn.peerConnection;
+  if (!pc) {
+    onEvent("warn", "ICE", `${peerLabel}: peer connection diagnostics unavailable.`);
+    return;
+  }
+
+  const candidateTypes = new Set<string>();
+
+  pc.addEventListener("icecandidate", (event) => {
+    if (!event.candidate) {
+      const types = candidateTypes.size > 0 ? [...candidateTypes].join(", ") : "none";
+      onEvent("info", "ICE", `${peerLabel}: candidate gathering complete. Candidate types: ${types}.`);
+      return;
+    }
+
+    const type = getCandidateType(event.candidate.candidate);
+    if (candidateTypes.has(type)) return;
+
+    candidateTypes.add(type);
+    onEvent(
+      type === "relay" ? "ok" : "info",
+      "ICE",
+      `${peerLabel}: discovered ${type} candidate${type === "relay" ? " through TURN" : ""}.`
+    );
+  });
+
+  pc.addEventListener("icecandidateerror", (event) => {
+    const error = event as Event & { url?: string; errorCode?: number; errorText?: string };
+    onEvent(
+      "warn",
+      "ICE",
+      `${peerLabel}: ICE server error${error.url ? ` via ${error.url}` : ""}${error.errorCode ? ` (${error.errorCode})` : ""}${error.errorText ? `: ${error.errorText}` : "."}`
+    );
+  });
+
+  pc.addEventListener("icegatheringstatechange", () => {
+    onEvent("info", "ICE", `${peerLabel}: gathering state ${pc.iceGatheringState}.`);
+  });
+
+  pc.addEventListener("connectionstatechange", () => {
+    const level = pc.connectionState === "failed" ? "error" : pc.connectionState === "connected" ? "ok" : "info";
+    onEvent(level, "ICE", `${peerLabel}: peer connection state ${pc.connectionState}.`);
+  });
+}
+
+const rtcConfig: ExtendedRTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     { urls: "stun:stun2.l.google.com:19302" },
     { urls: "stun:stun.services.mozilla.com" },
+    { urls: "stun:openrelay.metered.ca:80" },
     {
       urls: [
         "turn:eu-0.turn.peerjs.com:3478",
@@ -98,13 +185,16 @@ const rtcConfig: RTCConfiguration = {
       urls: [
         "turn:openrelay.metered.ca:80",
         "turn:openrelay.metered.ca:443",
-        "turn:openrelay.metered.ca:443?transport=tcp"
+        "turn:openrelay.metered.ca:80?transport=tcp",
+        "turn:openrelay.metered.ca:443?transport=tcp",
+        "turns:openrelay.metered.ca:443?transport=tcp"
       ],
       username: "openrelayproject",
       credential: "openrelayproject"
     }
   ],
-  iceCandidatePoolSize: 10
+  iceCandidatePoolSize: 10,
+  sdpSemantics: "unified-plan"
 };
 
 // 64 KB chunks — optimal for WebRTC DataChannel throughput
@@ -157,12 +247,14 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<DataConnection[]>([]);
   const pingRef = useRef<{ id: string; at: number } | null>(null);
+  const joinAttemptRef = useRef(0);
   // Rolling RTT window for EWMA smoothing (last 8 samples)
   const rttSamplesRef = useRef<number[]>([]);
   // Active FileStreamHandlers keyed by mediaId (guest side)
   const fileStreamHandlersRef = useRef<Map<string, FileStreamHandlers>>(new Map());
 
   const closeRoom = useCallback(() => {
+    joinAttemptRef.current += 1;
     onEventRef.current("info", "ROOM", "Initiating room closure. Terminating all peer connections.");
     connectionsRef.current.forEach((conn) => {
       onEventRef.current("info", "WEBRTC", `Closing connection to peer: ${conn.peer}`);
@@ -466,6 +558,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
 
     peer.on("connection", (conn) => {
       onEventRef.current("info", "WEBRTC", `Incoming connection from peer: ${conn.peer}`);
+      setupConnectionDiagnostics(conn, `Viewer ${conn.peer}`, onEventRef.current);
 
       conn.on("open", () => {
         connectionsRef.current.push(conn);
@@ -525,63 +618,108 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
 
   const joinWithOffer = useCallback(
     async (hostId: string) => {
+      const attemptId = joinAttemptRef.current + 1;
       closeRoom();
+      joinAttemptRef.current = attemptId;
       setRole("guest");
       setStatus("pairing");
       setLocalOffer(hostId);
       setLocalAnswer("");
 
-      const guestId = `SP-GUEST-${crypto.randomUUID().slice(0, 5).toUpperCase()}`;
-      onEventRef.current("info", "PEERJS", `Initializing guest node. Guest ID: ${guestId}`);
-      onEventRef.current("info", "WEBRTC", `Connecting to room: ${hostId}`);
+      const ignoredCloseConnections = new WeakSet<DataConnection>();
 
-      const peer = createPeer(guestId);
-      peerRef.current = peer;
+      const startGuestPeer = (relayOnly: boolean) => {
+        if (joinAttemptRef.current !== attemptId) return;
 
-      peer.on("open", (id) => {
-        onEventRef.current("ok", "PEERJS", `Connected to signaling broker. Guest ID: ${id}`);
-        onEventRef.current("info", "WEBRTC", `Negotiating handshake with host: ${hostId}`);
-        const conn = peer.connect(hostId);
+        if (peerRef.current) {
+          peerRef.current.destroy();
+          peerRef.current = null;
+        }
+        connectionsRef.current = [];
+        setConnectedPeers([]);
 
-        conn.on("open", () => {
-          connectionsRef.current.push(conn);
-          setConnectedPeers([hostId]);
-          setStatus("connected");
-          onEventRef.current("ok", "WEBRTC", `Joined room. Data channel open with host.`);
+        const guestId = `SP-GUEST-${crypto.randomUUID().slice(0, 5).toUpperCase()}`;
+        onEventRef.current(
+          "info",
+          "PEERJS",
+          `Initializing guest node. Guest ID: ${guestId}${relayOnly ? " (TURN relay-only retry)" : ""}`
+        );
+        onEventRef.current("info", "WEBRTC", `Connecting to room: ${hostId}`);
 
-          conn.send({
-            id: crypto.randomUUID(),
-            type: "room.hello",
-            sentAt: performance.now(),
-            payload: { peerId: guestId, label: `Viewer (${guestId.slice(9)})` }
+        const peer = createPeer(guestId, relayOnly);
+        peerRef.current = peer;
+
+        peer.on("open", (id) => {
+          if (joinAttemptRef.current !== attemptId) return;
+
+          onEventRef.current("ok", "PEERJS", `Connected to signaling broker. Guest ID: ${id}`);
+          onEventRef.current(
+            "info",
+            "WEBRTC",
+            `Negotiating handshake with host: ${hostId}${relayOnly ? " via TURN relay-only ICE" : ""}`
+          );
+          const conn = peer.connect(hostId, { reliable: true });
+          setupConnectionDiagnostics(conn, `Host ${hostId}`, onEventRef.current);
+
+          conn.on("open", () => {
+            if (joinAttemptRef.current !== attemptId) return;
+
+            connectionsRef.current.push(conn);
+            setConnectedPeers([hostId]);
+            setStatus("connected");
+            onEventRef.current("ok", "WEBRTC", `Joined room. Data channel open with host.`);
+
+            conn.send({
+              id: crypto.randomUUID(),
+              type: "room.hello",
+              sentAt: performance.now(),
+              payload: { peerId: guestId, label: `Viewer (${guestId.slice(9)})` }
+            });
+          });
+
+          conn.on("data", (data) => { handleMessage(conn, data); });
+
+          conn.on("iceStateChanged", (state) => {
+            const level = state === "failed" ? "error" : state === "disconnected" ? "warn" : "info";
+            onEventRef.current(level, "ICE", `Host ${hostId} ICE state: ${state}.`);
+          });
+
+          conn.on("close", () => {
+            if (joinAttemptRef.current !== attemptId || ignoredCloseConnections.has(conn)) return;
+
+            connectionsRef.current = [];
+            setConnectedPeers([]);
+            setStatus("disconnected");
+            setRemotePeer("Awaiting peer");
+            onEventRef.current("warn", "WEBRTC", `Host (${hostId}) disconnected.`);
+          });
+
+          conn.on("error", (err) => {
+            onEventRef.current("error", "WEBRTC", `Data channel error: ${describeConnectionError(err)}`);
+
+            if (err.type === "negotiation-failed" && !relayOnly) {
+              ignoredCloseConnections.add(conn);
+              onEventRef.current("warn", "WEBRTC", "Direct ICE negotiation failed. Retrying once with TURN relay-only mode.");
+              conn.close();
+              window.setTimeout(() => {
+                startGuestPeer(true);
+              }, 500);
+              return;
+            }
+
+            setStatus("failed");
           });
         });
 
-        conn.on("data", (data) => { handleMessage(conn, data); });
+        peer.on("error", (err) => {
+          if (joinAttemptRef.current !== attemptId) return;
 
-        conn.on("iceStateChanged", (state) => {
-          const level = state === "failed" ? "error" : state === "disconnected" ? "warn" : "info";
-          onEventRef.current(level, "ICE", `Host ${hostId} ICE state: ${state}.`);
-        });
-
-        conn.on("close", () => {
-          connectionsRef.current = [];
-          setConnectedPeers([]);
-          setStatus("disconnected");
-          setRemotePeer("Awaiting peer");
-          onEventRef.current("warn", "WEBRTC", `Host (${hostId}) disconnected.`);
-        });
-
-        conn.on("error", (err) => {
-          onEventRef.current("error", "WEBRTC", `Data channel error: ${describeConnectionError(err)}`);
+          onEventRef.current("error", "PEERJS", `Guest broker error: ${describeConnectionError(err)}`);
           setStatus("failed");
         });
-      });
+      };
 
-      peer.on("error", (err) => {
-        onEventRef.current("error", "PEERJS", `Guest broker error: ${describeConnectionError(err)}`);
-        setStatus("failed");
-      });
+      startGuestPeer(false);
 
       return "";
     },
