@@ -31,6 +31,10 @@ function parseDescription(signal: string): RTCSessionDescriptionInit {
   return parsed;
 }
 
+function hasRtcSupport() {
+  return typeof RTCPeerConnection !== "undefined";
+}
+
 async function waitForIceGathering(peer: RTCPeerConnection) {
   if (peer.iceGatheringState === "complete") {
     return;
@@ -152,7 +156,7 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
   );
 
   const bindChannel = useCallback(
-    (channel: RTCDataChannel) => {
+    (channel: RTCDataChannel, localLabel: string) => {
       channelRef.current = channel;
       channel.onmessage = handleMessage;
       channel.onopen = () => {
@@ -160,7 +164,7 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
         onEvent("ok", "DATA CHANNEL", "Control channel is open.");
         send("room.hello", {
           peerId,
-          label: role === "guest" ? "Guest node" : "Host node"
+          label: localLabel
         });
       };
       channel.onclose = () => {
@@ -168,7 +172,7 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
         onEvent("warn", "DATA CHANNEL", "Control channel closed.");
       };
     },
-    [handleMessage, onEvent, peerId, role, send]
+    [handleMessage, onEvent, peerId, send]
   );
 
   const createHostOffer = useCallback(async () => {
@@ -178,29 +182,37 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
     setLocalAnswer("");
     setLocalOffer("");
 
+    if (!hasRtcSupport()) {
+      setStatus("failed");
+      onEvent("error", "RTC", "WebRTC is unavailable. Open this app over HTTPS or localhost.");
+      return;
+    }
+
     const peer = new RTCPeerConnection(rtcConfig);
     connectionRef.current = peer;
     bindConnection(peer);
 
     const channel = peer.createDataChannel("syncplayer-control", { ordered: true });
-    bindChannel(channel);
+    bindChannel(channel, "Room owner");
 
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
     await waitForIceGathering(peer);
-    setLocalOffer(encodeDescription(peer.localDescription));
-    onEvent("info", "ROOM", "Host offer generated. Send it to the guest.");
+    const encodedOffer = encodeDescription(peer.localDescription);
+    setLocalOffer(encodedOffer);
+    onEvent("info", "ROOM", "Invite link is ready to share.");
+    return encodedOffer;
   }, [bindChannel, bindConnection, closeRoom, onEvent]);
 
   const acceptGuestAnswer = useCallback(
     async (answerSignal: string) => {
       if (!connectionRef.current) {
-        onEvent("error", "ROOM", "Create a host offer before accepting an answer.");
+        onEvent("error", "ROOM", "Create an invite link before applying a response link.");
         return;
       }
 
       await connectionRef.current.setRemoteDescription(parseDescription(answerSignal));
-      onEvent("ok", "ROOM", "Guest answer accepted.");
+      onEvent("ok", "ROOM", "Viewer response accepted. Connecting peer-to-peer.");
     },
     [onEvent]
   );
@@ -213,17 +225,25 @@ export function usePeerRoom({ onPlaybackState, onEvent }: PeerRoomOptions) {
       setLocalOffer("");
       setLocalAnswer("");
 
+      if (!hasRtcSupport()) {
+        setStatus("failed");
+        onEvent("error", "RTC", "WebRTC is unavailable. Open this app over HTTPS or localhost.");
+        return;
+      }
+
       const peer = new RTCPeerConnection(rtcConfig);
       connectionRef.current = peer;
       bindConnection(peer);
-      peer.ondatachannel = (event) => bindChannel(event.channel);
+      peer.ondatachannel = (event) => bindChannel(event.channel, "Viewer");
 
       await peer.setRemoteDescription(parseDescription(offerSignal));
       const answer = await peer.createAnswer();
       await peer.setLocalDescription(answer);
       await waitForIceGathering(peer);
-      setLocalAnswer(encodeDescription(peer.localDescription));
-      onEvent("info", "ROOM", "Guest answer generated. Send it back to the host.");
+      const encodedAnswer = encodeDescription(peer.localDescription);
+      setLocalAnswer(encodedAnswer);
+      onEvent("info", "ROOM", "Response link is ready. Send it back to the room owner.");
+      return encodedAnswer;
     },
     [bindChannel, bindConnection, closeRoom, onEvent]
   );

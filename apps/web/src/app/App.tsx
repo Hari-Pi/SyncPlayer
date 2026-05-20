@@ -8,7 +8,6 @@ import {
   Gauge,
   Link2,
   Pause,
-  Play,
   Radar,
   RadioTower,
   RotateCcw,
@@ -17,7 +16,6 @@ import {
   Settings,
   Shield,
   Signal,
-  Terminal,
   Upload,
   Video
 } from "lucide-react";
@@ -26,7 +24,8 @@ import { createActivity, type ActivityEntry, type ActivityLevel } from "@/featur
 import { usePeerRoom } from "@/features/room/usePeerRoom";
 import { createMediaHint, loadSyncCore, readDrift, type DriftReading } from "@/lib/wasm/syncCore";
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
-import { inferMediaKind, type LoadedMedia } from "@/lib/media/mediaTypes";
+import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia } from "@/lib/media/mediaTypes";
+import { createLocalTabChannel } from "@/lib/sync/localTabSync";
 import type { PlaybackSnapshot } from "@/lib/webrtc/messages";
 
 const emptyDrift: DriftReading = {
@@ -81,15 +80,67 @@ function copyText(value: string) {
   void navigator.clipboard?.writeText(value);
 }
 
+type ShareMedia = Pick<LoadedMedia, "id" | "title" | "sourceUrl" | "kind" | "format" | "origin">;
+type SharePayload =
+  | {
+      type: "invite";
+      offer: string;
+      media: ShareMedia | null;
+    }
+  | {
+      type: "response";
+      answer: string;
+    };
+
+function encodeSharePayload(payload: SharePayload) {
+  const bytes = new TextEncoder().encode(JSON.stringify(payload));
+  let binary = "";
+
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function decodeSharePayload(value: string): SharePayload {
+  const normalized = value.replace(/^.*#sync=/, "").replaceAll("-", "+").replaceAll("_", "/");
+  const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
+  const binary = atob(padded);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+
+  return JSON.parse(new TextDecoder().decode(bytes)) as SharePayload;
+}
+
+function createShareUrl(payload: SharePayload) {
+  return `${window.location.origin}${window.location.pathname}#sync=${encodeSharePayload(payload)}`;
+}
+
+function readSharePayloadFromUrl() {
+  if (!window.location.hash.startsWith("#sync=")) {
+    return null;
+  }
+
+  return decodeSharePayload(window.location.hash);
+}
+
+function isLocalhost() {
+  return ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+}
+
 export function App() {
-  const mediaRef = useRef<HTMLVideoElement & HTMLAudioElement>(null);
+  const mediaRef = useRef<HTMLMediaElement | null>(null);
   const remoteApplyRef = useRef(false);
   const lastBroadcastRef = useRef(0);
   const [clock, setClock] = useState(formatClock());
   const [media, setMedia] = useState<LoadedMedia | null>(null);
   const [remoteUrl, setRemoteUrl] = useState("");
-  const [hostAnswer, setHostAnswer] = useState("");
-  const [guestOffer, setGuestOffer] = useState("");
+  const [inviteLink, setInviteLink] = useState("");
+  const [responseLink, setResponseLink] = useState("");
+  const [responseInput, setResponseInput] = useState("");
+  const [localTabPeer, setLocalTabPeer] = useState("No local tab");
+  const handledShareLinkRef = useRef(false);
+  const localTabChannelRef = useRef<ReturnType<typeof createLocalTabChannel>>(null);
   const [activity, setActivity] = useState<ActivityEntry[]>([
     createActivity("info", "BOOT", "Command deck initialized.")
   ]);
@@ -105,6 +156,10 @@ export function App() {
 
   const log = useCallback((level: ActivityLevel, label: string, detail: string) => {
     setActivity((entries) => [createActivity(level, label, detail), ...entries].slice(0, 12));
+  }, []);
+
+  const bindMediaElement = useCallback((node: HTMLMediaElement | null) => {
+    mediaRef.current = node;
   }, []);
 
   const handleRemotePlayback = useCallback(
@@ -148,6 +203,101 @@ export function App() {
     onEvent: log
   });
 
+  const isSecureOrigin = window.isSecureContext || isLocalhost();
+  const roomActionLabel =
+    room.status === "connected"
+      ? "Peer Connected"
+      : room.role === "host" && inviteLink
+        ? "Room Hosted"
+        : room.status === "pairing"
+          ? "Hosting Room"
+          : "Start Room & Copy Invite";
+  const topInviteLabel = inviteLink ? "Invite Copied" : "Copy Invite Link";
+
+  const mountRemoteMedia = useCallback(
+    (url: string, source: "manual" | "invite") => {
+      let parsedUrl: URL;
+
+      try {
+        parsedUrl = new URL(url);
+      } catch {
+        log("error", "MEDIA", "That media URL is not valid.");
+        return false;
+      }
+
+      const format = inferMediaFormat(url);
+
+      setRemoteUrl(url);
+      setMedia({
+        id: `url:${url}`,
+        title: parsedUrl.pathname.split("/").pop() || "Remote stream",
+        sourceUrl: url,
+        kind: inferMediaKind(url),
+        format,
+        origin: "remote-url"
+      });
+      setDrift(emptyDrift);
+      log("ok", "MEDIA", source === "invite" ? "Media URL loaded from invite link." : `${mediaFormatLabel(format)} URL mounted.`);
+      return true;
+    },
+    [log]
+  );
+
+  const createInviteLink = useCallback(async () => {
+    const offer = await room.createHostOffer();
+
+    if (!offer) {
+      return;
+    }
+
+    const shareableMedia: ShareMedia | null =
+      media?.origin === "remote-url"
+        ? {
+            id: media.id,
+            title: media.title,
+            sourceUrl: media.sourceUrl,
+            kind: media.kind,
+            format: media.format,
+            origin: media.origin
+          }
+        : null;
+
+    const nextInviteLink = createShareUrl({
+      type: "invite",
+      offer,
+      media: shareableMedia
+    });
+
+    setInviteLink(nextInviteLink);
+    copyText(nextInviteLink);
+
+    if (media?.origin === "local-file") {
+      log("warn", "SHARE", "Invite link created. Local file transfer is not active yet, so the viewer will need the same file.");
+    } else if (shareableMedia) {
+      log("ok", "SHARE", "Invite link copied. The media URL will load for the viewer.");
+    } else {
+      log("ok", "SHARE", "Invite link copied. Add media whenever you are ready.");
+    }
+  }, [log, media, room]);
+
+  const acceptResponseLink = useCallback(
+    async (value: string) => {
+      try {
+        const payload = decodeSharePayload(value.trim());
+
+        if (payload.type !== "response") {
+          log("error", "SHARE", "That link is an invite link. Paste the viewer response link here.");
+          return;
+        }
+
+        await room.acceptGuestAnswer(payload.answer);
+      } catch {
+        log("error", "SHARE", "Could not read that response link.");
+      }
+    },
+    [log, room]
+  );
+
   useEffect(() => {
     loadSyncCore()
       .then(() => {
@@ -156,6 +306,12 @@ export function App() {
       })
       .catch(() => log("error", "WASM", "Sync core failed to load."));
   }, [log]);
+
+  useEffect(() => {
+    if (!isSecureOrigin) {
+      log("warn", "SECURE ORIGIN", "Mobile browsers may block WebRTC on LAN HTTP. Use localhost, HTTPS, or a trusted tunnel.");
+    }
+  }, [isSecureOrigin, log]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(formatClock()), 1000);
@@ -169,6 +325,77 @@ export function App() {
 
     return () => window.clearInterval(timer);
   }, [room]);
+
+  useEffect(() => {
+    const channel = createLocalTabChannel((message) => {
+      if (message.type === "hello") {
+        setLocalTabPeer(message.peerId);
+        log("ok", "LOCAL TAB", "Another SyncPlayer tab is available for same-device testing.");
+        return;
+      }
+
+      if (message.type === "playback") {
+        void handleRemotePlayback(message.payload, 0);
+      }
+    });
+
+    if (!channel) {
+      log("warn", "LOCAL TAB", "BroadcastChannel is unavailable in this browser.");
+      return;
+    }
+
+    localTabChannelRef.current = channel;
+    channel.post({ type: "hello" });
+    const timer = window.setInterval(() => channel.post({ type: "hello" }), 3000);
+
+    return () => {
+      window.clearInterval(timer);
+      channel.close();
+      localTabChannelRef.current = null;
+    };
+  }, [handleRemotePlayback, log]);
+
+  useEffect(() => {
+    if (handledShareLinkRef.current) {
+      return;
+    }
+
+    const payload = readSharePayloadFromUrl();
+
+    if (!payload) {
+      return;
+    }
+
+    handledShareLinkRef.current = true;
+
+    if (payload.type === "invite") {
+      if (payload.media?.origin === "remote-url") {
+        mountRemoteMedia(payload.media.sourceUrl, "invite");
+      }
+
+      void room
+        .joinWithOffer(payload.offer)
+        .then((answer) => {
+          if (!answer) {
+            return;
+          }
+
+          const nextResponseLink = createShareUrl({
+            type: "response",
+            answer
+          });
+
+          setResponseLink(nextResponseLink);
+          copyText(nextResponseLink);
+          log("ok", "SHARE", "Response link copied. Send it back to the room owner.");
+        })
+        .catch(() => log("error", "SHARE", "Could not join from this invite link."));
+      return;
+    }
+
+    setResponseInput(window.location.href);
+    log("info", "SHARE", "Response link detected. Paste it into the open host tab to finish connecting.");
+  }, [log, mountRemoteMedia, room]);
 
   const publishSnapshot = useCallback(() => {
     const element = mediaRef.current;
@@ -190,6 +417,10 @@ export function App() {
 
     if (now - lastBroadcastRef.current > 250) {
       room.sendPlaybackState(nextSnapshot);
+      localTabChannelRef.current?.post({
+        type: "playback",
+        payload: nextSnapshot
+      });
       lastBroadcastRef.current = now;
     }
   }, [media, room]);
@@ -215,6 +446,7 @@ export function App() {
         title: file.name,
         sourceUrl,
         kind: inferMediaKind(file.type || file.name),
+        format: inferMediaFormat(file.type || file.name),
         origin: "local-file",
         sizeBytes: file.size,
         modifiedMs: file.lastModified
@@ -232,16 +464,93 @@ export function App() {
       return;
     }
 
-    setMedia({
-      id: `url:${url}`,
-      title: new URL(url).pathname.split("/").pop() || "Remote stream",
-      sourceUrl: url,
-      kind: inferMediaKind(url),
-      origin: "remote-url"
+    mountRemoteMedia(url, "manual");
+  }, [mountRemoteMedia, remoteUrl]);
+
+  useEffect(() => {
+    const element = mediaRef.current;
+    let disposed = false;
+    let engineCleanup: (() => void) | undefined;
+
+    if (!element || !media) {
+      return;
+    }
+
+    element.pause();
+    element.removeAttribute("src");
+    element.load();
+
+    const attachMedia = async () => {
+      if (media.format === "hls") {
+        if (element.canPlayType("application/vnd.apple.mpegurl")) {
+          element.src = media.sourceUrl;
+          element.load();
+          log("ok", "HLS", "Using native HLS playback.");
+          return;
+        }
+
+        const { default: Hls } = await import("hls.js");
+
+        if (disposed) {
+          return;
+        }
+
+        if (!Hls.isSupported()) {
+          log("error", "HLS", "This browser cannot play HLS streams.");
+          return;
+        }
+
+        const hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: true
+        });
+
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          log("ok", "HLS", "Manifest parsed and attached.");
+        });
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          log(data.fatal ? "error" : "warn", "HLS", `${data.type}: ${data.details}`);
+        });
+        hls.loadSource(media.sourceUrl);
+        hls.attachMedia(element);
+        engineCleanup = () => hls.destroy();
+        return;
+      }
+
+      if (media.format === "dash") {
+        const dashjs = await import("dashjs");
+
+        if (disposed) {
+          return;
+        }
+
+        if (!dashjs.supportsMediaSource()) {
+          log("error", "DASH", "This browser cannot play MPEG-DASH streams.");
+          return;
+        }
+
+        const player = dashjs.MediaPlayer().create();
+        player.initialize(element, media.sourceUrl, false);
+        log("ok", "DASH", "MPEG-DASH manifest attached.");
+        engineCleanup = () => player.reset();
+        return;
+      }
+
+      element.src = media.sourceUrl;
+      element.load();
+    };
+
+    void attachMedia().catch((error: unknown) => {
+      log("error", "MEDIA", error instanceof Error ? error.message : "Media engine failed to attach.");
     });
-    setDrift(emptyDrift);
-    log("ok", "MEDIA", "Remote media URL mounted.");
-  }, [log, remoteUrl]);
+
+    return () => {
+      disposed = true;
+      engineCleanup?.();
+      element.removeAttribute("src");
+      element.load();
+    };
+  }, [log, media?.format, media?.id, media?.sourceUrl]);
 
   const handleLoadedMetadata = useCallback(async () => {
     const element = mediaRef.current;
@@ -290,9 +599,17 @@ export function App() {
             <Signal size={15} />
             {room.status.toUpperCase()}
           </span>
+          {!isSecureOrigin ? <span>LAN HTTP LIMITED</span> : null}
           <span>{clock}</span>
         </div>
       </header>
+
+      {!isSecureOrigin ? (
+        <div className="warning-band">
+          Mobile Firefox may block WebRTC on this LAN HTTP address. The page can load, but peer sync may fail until the
+          app is opened from a secure origin.
+        </div>
+      ) : null}
 
       <section className="deck__grid">
         <aside className="left-rail">
@@ -302,19 +619,7 @@ export function App() {
               <Metric label="LINK" value={room.status.toUpperCase()} tone={statusTone} />
               <Metric label="LATENCY" value={`${room.latencyMs}ms`} tone={room.latencyMs < 90 ? "ok" : "warn"} />
               <Metric label="PEER" value={room.remotePeer} />
-            </div>
-          </Panel>
-
-          <Panel title="Media Identity" icon={mediaIcon}>
-            <div className="identity-block">
-              <strong>{media?.title || "No media mounted"}</strong>
-              <span>{media?.id || "Awaiting local file or direct URL"}</span>
-            </div>
-            <div className="metrics-grid">
-              <Metric label="ORIGIN" value={media?.origin?.replace("-", " ").toUpperCase() || "EMPTY"} />
-              <Metric label="TYPE" value={media?.kind?.toUpperCase() || "UNKNOWN"} />
-              <Metric label="SIZE" value={formatBytes(media?.sizeBytes || 0)} />
-              <Metric label="DURATION" value={formatDuration(media?.durationSecs || snapshot.duration)} />
+              <Metric label="LOCAL TAB" value={localTabPeer} tone={localTabPeer === "No local tab" ? "normal" : "ok"} />
             </div>
           </Panel>
 
@@ -330,9 +635,53 @@ export function App() {
               </div>
             </div>
           </Panel>
+
+          <Panel title="Media Identity" icon={mediaIcon}>
+            <div className="identity-block">
+              <strong>{media?.title || "No media mounted"}</strong>
+              <span>{media?.id || "Awaiting local file or direct URL"}</span>
+            </div>
+            <div className="metrics-grid">
+              <Metric label="ORIGIN" value={media?.origin?.replace("-", " ").toUpperCase() || "EMPTY"} />
+              <Metric label="TYPE" value={media?.kind?.toUpperCase() || "UNKNOWN"} />
+              <Metric label="FORMAT" value={media ? mediaFormatLabel(media.format) : "UNKNOWN"} />
+              <Metric label="SIZE" value={formatBytes(media?.sizeBytes || 0)} />
+              <Metric label="DURATION" value={formatDuration(media?.durationSecs || snapshot.duration)} />
+            </div>
+          </Panel>
         </aside>
 
         <section className="main-stage">
+          <div className="control-strip">
+            <label className="file-button">
+              <Upload size={16} />
+              Select File
+              <input accept="audio/*,video/*" type="file" onChange={handleLocalFile} />
+            </label>
+            <div className="url-loader">
+              <Link2 size={16} />
+              <input
+                value={remoteUrl}
+                onChange={(event) => setRemoteUrl(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    void handleRemoteUrl();
+                  }
+                }}
+                placeholder="Paste MP4, MP3, M3U8, MPD, WebM..."
+                aria-label="Remote media URL, including MP4, WebM, M3U8, MPD, MP3, WAV, or OGG"
+              />
+              <button type="button" onClick={handleRemoteUrl}>
+                <Send size={15} />
+                Load URL
+              </button>
+            </div>
+            <button type="button" onClick={createInviteLink}>
+              <Clipboard size={15} />
+              {topInviteLabel}
+            </button>
+          </div>
+
           <Panel title="Playback Surface" icon={<Video size={15} />} className="player-panel">
             <div className="player-shell">
               {media ? (
@@ -341,8 +690,7 @@ export function App() {
                     <AudioLines size={76} />
                     <strong>{media.title}</strong>
                     <audio
-                      ref={mediaRef}
-                      src={media.sourceUrl}
+                      ref={bindMediaElement}
                       controls
                       onLoadedMetadata={handleLoadedMetadata}
                       onPlay={publishSnapshot}
@@ -354,8 +702,7 @@ export function App() {
                   </div>
                 ) : (
                   <video
-                    ref={mediaRef}
-                    src={media.sourceUrl}
+                    ref={bindMediaElement}
                     controls
                     playsInline
                     onLoadedMetadata={handleLoadedMetadata}
@@ -375,87 +722,73 @@ export function App() {
               )}
             </div>
           </Panel>
-
-          <div className="control-strip">
-            <label className="file-button">
-              <Upload size={16} />
-              Local File
-              <input accept="audio/*,video/*" type="file" onChange={handleLocalFile} />
-            </label>
-            <div className="url-loader">
-              <Link2 size={16} />
-              <input
-                value={remoteUrl}
-                onChange={(event) => setRemoteUrl(event.target.value)}
-                placeholder="https://example.com/media.mp4"
-              />
-              <button type="button" onClick={handleRemoteUrl}>
-                <Send size={15} />
-              </button>
-            </div>
-            <button type="button" onClick={publishSnapshot}>
-              <CircleDot size={15} />
-              Broadcast State
-            </button>
-          </div>
         </section>
 
         <aside className="right-rail">
-          <Panel title="Pairing Console" icon={<Terminal size={15} />}>
-            <div className="pairing-actions">
-              <button type="button" onClick={room.createHostOffer}>
-                <Play size={15} />
-                Create Host Offer
+          <Panel title="Share Room" icon={<Link2 size={15} />}>
+            <div className="share-flow">
+              <button type="button" className="primary-action" onClick={createInviteLink}>
+                <Clipboard size={15} />
+                {roomActionLabel}
               </button>
               <button type="button" onClick={room.closeRoom}>
                 <Pause size={15} />
-                Close Link
+                End Room
               </button>
             </div>
 
-            <label className="signal-box">
-              Host offer
-              <textarea readOnly value={room.localOffer} placeholder="Create a host offer, then send this block to a guest." />
-              <button type="button" onClick={() => copyText(room.localOffer)}>
+            <div className="helper-copy">
+              <strong>How sharing works</strong>
+              <p>
+                Send the invite link to a viewer. They open it, SyncPlayer loads the same online URL when possible, and
+                copies a response link for them to send back.
+              </p>
+            </div>
+
+            {media?.origin === "local-file" ? (
+              <div className="helper-copy helper-copy--warn">
+                Local files are private to this device right now. The link connects playback, but the viewer still needs
+                the same file until P2P file transfer is added.
+              </div>
+            ) : null}
+
+            <label className="signal-box signal-box--compact">
+              Invite link to send
+              <input readOnly value={inviteLink} placeholder="Select media, then click Start Room & Copy Invite." />
+              <button type="button" onClick={() => copyText(inviteLink)}>
                 <Clipboard size={14} />
-                Copy Offer
+                Copy Invite Link
               </button>
             </label>
 
-            <label className="signal-box">
-              Guest answer for host
-              <textarea
-                value={hostAnswer}
-                onChange={(event) => setHostAnswer(event.target.value)}
-                placeholder="Host pastes the guest answer here."
+            <label className="signal-box signal-box--compact">
+              Response link from viewer
+              <input
+                value={responseInput}
+                onChange={(event) => setResponseInput(event.target.value)}
+                placeholder="Paste the response link they send back."
               />
-              <button type="button" onClick={() => void room.acceptGuestAnswer(hostAnswer)}>
+              <button type="button" onClick={() => void acceptResponseLink(responseInput)}>
                 <BadgeCheck size={14} />
-                Accept Answer
+                Finish Connection
               </button>
             </label>
 
-            <label className="signal-box">
-              Offer received as guest
-              <textarea
-                value={guestOffer}
-                onChange={(event) => setGuestOffer(event.target.value)}
-                placeholder="Guest pastes the host offer here."
-              />
-              <button type="button" onClick={() => void room.joinWithOffer(guestOffer)}>
-                <RotateCcw size={14} />
-                Generate Answer
-              </button>
-            </label>
+            {responseLink ? (
+              <label className="signal-box signal-box--compact">
+                Your response link
+                <input readOnly value={responseLink} />
+                <button type="button" onClick={() => copyText(responseLink)}>
+                  <RotateCcw size={14} />
+                  Copy Response Link
+                </button>
+              </label>
+            ) : null}
 
-            <label className="signal-box">
-              Generated guest answer
-              <textarea readOnly value={room.localAnswer} placeholder="Guest sends this answer back to the host." />
-              <button type="button" onClick={() => copyText(room.localAnswer)}>
-                <Clipboard size={14} />
-                Copy Answer
-              </button>
-            </label>
+            <button type="button" onClick={publishSnapshot}>
+              <CircleDot size={15} />
+              Send Current Playback State
+            </button>
           </Panel>
         </aside>
       </section>
@@ -485,4 +818,3 @@ export function App() {
     </main>
   );
 }
-

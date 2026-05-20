@@ -1,0 +1,9 @@
+node_modules
+dist
+target
+*.log
+*.tsbuildinfo
+.DS_Store
+.pnpm-store
+crates/sync-core/pkg
+apps/web/certs/*.pem
