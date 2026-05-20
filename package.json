@@ -6,12 +6,14 @@
   "scripts": {
     "build": "pnpm build:wasm && pnpm --filter @syncplayer/web build",
     "build:wasm": "PATH=\"$HOME/.cargo/bin:$PATH\" wasm-pack build crates/sync-core --target web --out-dir pkg",
+    "build:web": "pnpm --filter @syncplayer/web build",
     "dev": "pnpm build:wasm && pnpm --filter @syncplayer/web dev",
     "dev:https": "pnpm build:wasm && pnpm --filter @syncplayer/web dev:https",
-    "typecheck": "pnpm --filter @syncplayer/web typecheck"
+    "typecheck": "pnpm --filter @syncplayer/web typecheck",
+    "vercel-build": "pnpm --filter @syncplayer/web build"
   },
   "packageManager": "pnpm@11.1.3",
   "engines": {
-    "node": ">=26.0.0"
+    "node": ">=22.12.0"
   }
 }

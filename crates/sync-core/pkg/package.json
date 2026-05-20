@@ -1,0 +1,16 @@
+{
+  "name": "sync-core",
+  "type": "module",
+  "description": "WASM sync primitives for SyncPlayer.",
+  "version": "0.1.0",
+  "files": [
+    "sync_core_bg.wasm",
+    "sync_core.js",
+    "sync_core.d.ts"
+  ],
+  "main": "sync_core.js",
+  "types": "sync_core.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
