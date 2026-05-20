@@ -673,12 +673,15 @@ export function App() {
       artRef.current = null;
     }
 
-    const type = media.format === "hls" ? "m3u8" : media.format === "dash" ? "mpd" : undefined;
+    // ArtPlayer throws if `type` is explicitly `undefined`; only include it for
+    // custom-loaded stream formats (hls → m3u8, dash → mpd).
+    const streamType =
+      media.format === "hls" ? "m3u8" : media.format === "dash" ? "mpd" : null;
 
     const art = new Artplayer({
       container,
       url: media.sourceUrl,
-      type,
+      ...(streamType ? { type: streamType } : {}),
       theme: "#37f3ff",
       volume: 0.7,
       muted: false,
