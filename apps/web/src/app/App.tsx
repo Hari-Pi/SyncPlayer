@@ -1,5 +1,6 @@
 import {
   Activity,
+  AlertTriangle,
   AudioLines,
   BadgeCheck,
   CircleDot,
@@ -20,6 +21,7 @@ import {
   Video
 } from "lucide-react";
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Artplayer from "artplayer";
 import { createActivity, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
 import { usePeerRoom } from "@/features/room/usePeerRoom";
 import { createMediaHint, loadSyncCore, readDrift, type DriftReading } from "@/lib/wasm/syncCore";
@@ -41,11 +43,13 @@ function cx(...parts: Array<string | false | null | undefined>) {
 function Panel({
   title,
   icon,
+  action,
   children,
   className
 }: {
   title: string;
   icon?: React.ReactNode;
+  action?: React.ReactNode;
   children: React.ReactNode;
   className?: string;
 }) {
@@ -56,6 +60,7 @@ function Panel({
           {icon}
           {title}
         </span>
+        {action}
         <span className="panel__rail" />
       </div>
       {children}
@@ -130,6 +135,8 @@ function isLocalhost() {
 
 export function App() {
   const mediaRef = useRef<HTMLMediaElement | null>(null);
+  const artplayerContainerRef = useRef<HTMLDivElement | null>(null);
+  const artRef = useRef<Artplayer | null>(null);
   const remoteApplyRef = useRef(false);
   const lastBroadcastRef = useRef(0);
   const [clock, setClock] = useState(formatClock());
@@ -142,6 +149,8 @@ export function App() {
   const [openedThroughRoomLink, setOpenedThroughRoomLink] = useState(false);
   const handledShareLinkRef = useRef(false);
   const localTabChannelRef = useRef<ReturnType<typeof createLocalTabChannel>>(null);
+  const roleRef = useRef<"solo" | "host" | "guest">("solo");
+  const manualPauseTimesRef = useRef<number[]>([]);
   const [activity, setActivity] = useState<ActivityEntry[]>([
     createActivity("info", "BOOT", "Command deck initialized.")
   ]);
@@ -169,6 +178,10 @@ export function App() {
 
       if (!element || !media || remoteSnapshot.mediaId !== media.id) {
         log("warn", "SYNC", "Remote playback state received for different media.");
+        return;
+      }
+
+      if (roleRef.current === "host") {
         return;
       }
 
@@ -203,6 +216,10 @@ export function App() {
     onPlaybackState: handleRemotePlayback,
     onEvent: log
   });
+
+  useEffect(() => {
+    roleRef.current = room.role;
+  }, [room.role]);
 
   const isSecureOrigin = window.isSecureContext || isLocalhost();
   const roomActionLabel =
@@ -418,7 +435,9 @@ export function App() {
     setSnapshot(nextSnapshot);
 
     if (now - lastBroadcastRef.current > 250) {
-      room.sendPlaybackState(nextSnapshot);
+      if (room.role === "host") {
+        room.sendPlaybackState(nextSnapshot);
+      }
       localTabChannelRef.current?.post({
         type: "playback",
         payload: nextSnapshot
@@ -431,6 +450,63 @@ export function App() {
     const timer = window.setInterval(publishSnapshot, 1500);
     return () => window.clearInterval(timer);
   }, [publishSnapshot]);
+
+  const copyActivityLogs = useCallback(() => {
+    const formattedLogs = activity
+      .slice()
+      .reverse()
+      .map((entry) => `[${entry.at}] [${entry.level.toUpperCase()}] ${entry.label}: ${entry.detail}`)
+      .join("\n");
+    copyText(formattedLogs);
+    log("ok", "SHARE", "Activity logs copied to clipboard.");
+  }, [activity, log]);
+
+  const handlePause = useCallback(() => {
+    const element = mediaRef.current;
+    if (!element) return;
+
+    if (remoteApplyRef.current) {
+      publishSnapshot();
+      return;
+    }
+
+    if (room.role === "host") {
+      publishSnapshot();
+      return;
+    }
+
+    if (room.role === "guest") {
+      const now = Date.now();
+      manualPauseTimesRef.current = manualPauseTimesRef.current.filter(
+        (t) => now - t < 60000
+      );
+
+      if (manualPauseTimesRef.current.length >= 3) {
+        log("warn", "LIMIT", "Viewer pause limit exceeded (3 pauses per minute max). Resuming playback.");
+        void element.play().catch(() => {
+          log("error", "PLAYBACK", "Failed to override guest pause restriction.");
+        });
+      } else {
+        manualPauseTimesRef.current.push(now);
+        log("info", "PLAYBACK", `Local pause registered (${manualPauseTimesRef.current.length}/3 in last 1m).`);
+        publishSnapshot();
+      }
+    } else {
+      publishSnapshot();
+    }
+  }, [room.role, publishSnapshot, log]);
+
+  const handleLoadedMetadata = useCallback(async () => {
+    const element = mediaRef.current;
+
+    if (!element || !media) {
+      return;
+    }
+
+    const duration = element.duration || 0;
+    setMedia({ ...media, durationSecs: duration });
+    setSnapshot((current) => ({ ...current, duration }));
+  }, [media]);
 
   const handleLocalFile = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
@@ -469,14 +545,31 @@ export function App() {
     mountRemoteMedia(url, "manual");
   }, [mountRemoteMedia, remoteUrl]);
 
+  const publishSnapshotRef = useRef(publishSnapshot);
+  const handlePauseRef = useRef(handlePause);
+  const handleLoadedMetadataRef = useRef(handleLoadedMetadata);
+
+  useEffect(() => {
+    publishSnapshotRef.current = publishSnapshot;
+  }, [publishSnapshot]);
+
+  useEffect(() => {
+    handlePauseRef.current = handlePause;
+  }, [handlePause]);
+
+  useEffect(() => {
+    handleLoadedMetadataRef.current = handleLoadedMetadata;
+  }, [handleLoadedMetadata]);
+
+  // Audio media loader
   useEffect(() => {
     const element = mediaRef.current;
-    let disposed = false;
-    let engineCleanup: (() => void) | undefined;
-
-    if (!element || !media) {
+    if (!element || !media || media.kind !== "audio") {
       return;
     }
+
+    let disposed = false;
+    let engineCleanup: (() => void) | undefined;
 
     element.pause();
     element.removeAttribute("src");
@@ -487,7 +580,7 @@ export function App() {
         if (element.canPlayType("application/vnd.apple.mpegurl")) {
           element.src = media.sourceUrl;
           element.load();
-          log("ok", "HLS", "Using native HLS playback.");
+          log("ok", "HLS", "Using native HLS playback for audio.");
           return;
         }
 
@@ -498,7 +591,7 @@ export function App() {
         }
 
         if (!Hls.isSupported()) {
-          log("error", "HLS", "This browser cannot play HLS streams.");
+          log("error", "HLS", "This browser cannot play HLS audio streams.");
           return;
         }
 
@@ -508,7 +601,7 @@ export function App() {
         });
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          log("ok", "HLS", "Manifest parsed and attached.");
+          log("ok", "HLS", "HLS Audio manifest parsed and attached.");
         });
         hls.on(Hls.Events.ERROR, (_event, data) => {
           log(data.fatal ? "error" : "warn", "HLS", `${data.type}: ${data.details}`);
@@ -527,13 +620,13 @@ export function App() {
         }
 
         if (!dashjs.supportsMediaSource()) {
-          log("error", "DASH", "This browser cannot play MPEG-DASH streams.");
+          log("error", "DASH", "This browser cannot play MPEG-DASH audio streams.");
           return;
         }
 
         const player = dashjs.MediaPlayer().create();
         player.initialize(element, media.sourceUrl, false);
-        log("ok", "DASH", "MPEG-DASH manifest attached.");
+        log("ok", "DASH", "MPEG-DASH audio manifest attached.");
         engineCleanup = () => player.reset();
         return;
       }
@@ -543,7 +636,7 @@ export function App() {
     };
 
     void attachMedia().catch((error: unknown) => {
-      log("error", "MEDIA", error instanceof Error ? error.message : "Media engine failed to attach.");
+      log("error", "MEDIA", error instanceof Error ? error.message : "Media engine failed to attach audio.");
     });
 
     return () => {
@@ -552,19 +645,123 @@ export function App() {
       element.removeAttribute("src");
       element.load();
     };
-  }, [log, media?.format, media?.id, media?.sourceUrl]);
+  }, [log, media?.format, media?.id, media?.sourceUrl, media?.kind]);
 
-  const handleLoadedMetadata = useCallback(async () => {
-    const element = mediaRef.current;
-
-    if (!element || !media) {
+  // Video media loader via ArtPlayer
+  useEffect(() => {
+    const container = artplayerContainerRef.current;
+    if (!container || !media || media.kind !== "video") {
       return;
     }
 
-    const duration = element.duration || 0;
-    setMedia({ ...media, durationSecs: duration });
-    setSnapshot((current) => ({ ...current, duration }));
-  }, [media]);
+    if (artRef.current) {
+      artRef.current.destroy(true);
+      artRef.current = null;
+    }
+
+    const type = media.format === "hls" ? "m3u8" : media.format === "dash" ? "mpd" : undefined;
+
+    const art = new Artplayer({
+      container,
+      url: media.sourceUrl,
+      type,
+      theme: "#37f3ff",
+      volume: 0.7,
+      muted: false,
+      autoplay: false,
+      playbackRate: true,
+      aspectRatio: true,
+      setting: true,
+      hotkey: true,
+      pip: true,
+      fullscreen: true,
+      fullscreenWeb: true,
+      miniProgressBar: true,
+      playsInline: true,
+      airplay: true,
+      customType: {
+        m3u8: function (video, url, artInstance) {
+          import("hls.js").then(({ default: Hls }) => {
+            if (!Hls.isSupported()) {
+              if (video.canPlayType("application/vnd.apple.mpegurl")) {
+                video.src = url;
+              } else {
+                log("error", "HLS", "HLS is not supported in this browser.");
+              }
+              return;
+            }
+            const hls = new Hls({
+              enableWorker: true,
+              lowLatencyMode: true
+            });
+            hls.loadSource(url);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+              log("ok", "HLS", "HLS stream manifest attached to ArtPlayer.");
+            });
+            hls.on(Hls.Events.ERROR, (_, data) => {
+              log(data.fatal ? "error" : "warn", "HLS", `${data.type}: ${data.details}`);
+            });
+            artInstance.on("destroy", () => hls.destroy());
+          });
+        },
+        mpd: function (video, url, artInstance) {
+          import("dashjs").then((dashjs) => {
+            if (!dashjs.supportsMediaSource()) {
+              log("error", "DASH", "MPEG-DASH is not supported in this browser.");
+              return;
+            }
+            const player = dashjs.MediaPlayer().create();
+            player.initialize(video, url, false);
+            log("ok", "DASH", "MPEG-DASH stream attached to ArtPlayer.");
+            artInstance.on("destroy", () => player.reset());
+          });
+        }
+      }
+    });
+
+    artRef.current = art;
+
+    art.on("ready", () => {
+      const video = art.video;
+      mediaRef.current = video;
+
+      const onPlay = () => publishSnapshotRef.current();
+      const onPause = () => handlePauseRef.current();
+      const onSeeked = () => publishSnapshotRef.current();
+      const onRateChange = () => publishSnapshotRef.current();
+      const onTimeUpdate = () => publishSnapshotRef.current();
+      const onLoadedMetadata = () => handleLoadedMetadataRef.current();
+
+      video.addEventListener("play", onPlay);
+      video.addEventListener("pause", onPause);
+      video.addEventListener("seeked", onSeeked);
+      video.addEventListener("ratechange", onRateChange);
+      video.addEventListener("timeupdate", onTimeUpdate);
+      video.addEventListener("loadedmetadata", onLoadedMetadata);
+
+      if (video.duration) {
+        onLoadedMetadata();
+      }
+
+      art.on("destroy", () => {
+        video.removeEventListener("play", onPlay);
+        video.removeEventListener("pause", onPause);
+        video.removeEventListener("seeked", onSeeked);
+        video.removeEventListener("ratechange", onRateChange);
+        video.removeEventListener("timeupdate", onTimeUpdate);
+        video.removeEventListener("loadedmetadata", onLoadedMetadata);
+      });
+    });
+
+    return () => {
+      if (artRef.current) {
+        artRef.current.destroy(true);
+        artRef.current = null;
+      }
+      mediaRef.current = null;
+    };
+  }, [log, media?.format, media?.id, media?.sourceUrl, media?.kind]);
 
   const statusTone = room.status === "connected" ? "ok" : room.status === "failed" ? "warn" : "normal";
   const mediaIcon = media?.kind === "audio" ? <AudioLines size={17} /> : <FileVideo size={17} />;
@@ -587,7 +784,12 @@ export function App() {
             <Radar size={24} />
           </span>
           <div>
-            <strong>SyncPlayer</strong>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+              <strong>SyncPlayer</strong>
+              {openedThroughRoomLink && (
+                <span className="brand__badge">ROOM LINK CONNECTED</span>
+              )}
+            </div>
             <span>Command Deck</span>
           </div>
         </div>
@@ -623,40 +825,58 @@ export function App() {
               <span className="status-band__title">Live Session Synchronized</span>
               <span className="status-band__desc">
                 {room.role === "guest"
-                  ? `Connected to Host (${room.remotePeer}). Your playback is locked to the host's timeline. Delay is ${room.latencyMs}ms.`
-                  : `Hosting Active Room with Viewer (${room.remotePeer}). Broadcast stream running. Peer latency is ${room.latencyMs}ms.`}
+                  ? `Connected to Host (${room.connectedPeers[0] || "Unknown"}). Your playback is locked to the host's timeline. Delay is ${room.latencyMs}ms.`
+                  : `Hosting Active Room. Connected to ${room.connectedPeers.length} viewer(s): ${room.connectedPeers.join(", ")}. Broadcast stream running. Peer latency is ${room.latencyMs}ms.`}
               </span>
             </div>
           </div>
           <div className="status-band__actions">
-            <button type="button" className="status-band__btn" onClick={publishSnapshot}>
-              Force Sync State
-            </button>
+            {room.role === "host" && (
+              <button type="button" className="status-band__btn" onClick={publishSnapshot}>
+                Force Sync State
+              </button>
+            )}
             <button type="button" className="status-band__btn" onClick={room.closeRoom}>
               Disconnect
             </button>
           </div>
         </div>
-      ) : room.role === "guest" ? (
+      ) : room.role === "guest" && room.status === "pairing" ? (
         <div className="status-band status-band--warn">
           <div className="status-band__content">
-            <div className="status-band__icon">
-              <Link2 size={18} />
+            <div className="status-band__icon status-band__icon--pulse">
+              <Radar size={18} />
             </div>
             <div className="status-band__text-group">
-              <span className="status-band__title">Invite Link Loaded — Handshake Required</span>
+              <span className="status-band__title">Connecting to Room Host...</span>
               <span className="status-band__desc">
-                You have joined via room link. We copied your <strong>Response Link</strong> to your clipboard. Send this Response Link back to the Host so they can finish connecting your timelines!
+                Establishing automated WebRTC link to Host (<strong>{room.localOffer}</strong>). Please wait while signaling completes...
               </span>
             </div>
           </div>
           <div className="status-band__actions">
-            {responseLink ? (
-              <button type="button" className="status-band__btn primary-action" onClick={() => copyText(responseLink)}>
-                <Clipboard size={14} />
-                Copy Response Link
-              </button>
-            ) : null}
+            <button type="button" className="status-band__btn" onClick={room.closeRoom}>
+              Cancel Join
+            </button>
+          </div>
+        </div>
+      ) : room.role === "guest" && room.status === "failed" ? (
+        <div className="status-band status-band--error">
+          <div className="status-band__content">
+            <div className="status-band__icon">
+              <AlertTriangle size={18} />
+            </div>
+            <div className="status-band__text-group">
+              <span className="status-band__title">Connection Failed</span>
+              <span className="status-band__desc">
+                Could not connect to Host (<strong>{room.localOffer}</strong>). Check the Activity Log below for details.
+              </span>
+            </div>
+          </div>
+          <div className="status-band__actions">
+            <button type="button" className="status-band__btn primary-action" onClick={() => void room.joinWithOffer(room.localOffer)}>
+              Retry Connection
+            </button>
             <button type="button" className="status-band__btn" onClick={room.closeRoom}>
               Cancel Join
             </button>
@@ -669,9 +889,9 @@ export function App() {
               <Radar size={18} />
             </div>
             <div className="status-band__text-group">
-              <span className="status-band__title">Awaiting Viewer Response</span>
+              <span className="status-band__title">Room Hosted — Waiting for Viewers</span>
               <span className="status-band__desc">
-                Room invite is copied to your clipboard. Send it to your viewer. When they open it, they will give you a Response Link. Paste it into the "Response link from viewer" input below to connect.
+                Room is online. Share the invite link with viewers to synchronize your media playback automatically.
               </span>
             </div>
           </div>
@@ -770,23 +990,17 @@ export function App() {
                       controls
                       onLoadedMetadata={handleLoadedMetadata}
                       onPlay={publishSnapshot}
-                      onPause={publishSnapshot}
+                      onPause={handlePause}
                       onSeeked={publishSnapshot}
                       onRateChange={publishSnapshot}
                       onTimeUpdate={publishSnapshot}
                     />
                   </div>
                 ) : (
-                  <video
-                    ref={bindMediaElement}
-                    controls
-                    playsInline
-                    onLoadedMetadata={handleLoadedMetadata}
-                    onPlay={publishSnapshot}
-                    onPause={publishSnapshot}
-                    onSeeked={publishSnapshot}
-                    onRateChange={publishSnapshot}
-                    onTimeUpdate={publishSnapshot}
+                  <div
+                    ref={artplayerContainerRef}
+                    className="artplayer-container"
+                    style={{ width: "100%", height: "100%", minHeight: "360px" }}
                   />
                 )
               ) : (
@@ -816,8 +1030,7 @@ export function App() {
             <div className="helper-copy">
               <strong>How sharing works</strong>
               <p>
-                Send the invite link to a viewer. They open it, SyncPlayer loads the same online URL when possible, and
-                copies a response link for them to send back.
+                Send the invite link to a viewer. Once they open it, they will connect to your room automatically using PeerJS.
               </p>
             </div>
 
@@ -837,31 +1050,24 @@ export function App() {
               </button>
             </label>
 
-            <label className="signal-box signal-box--compact">
-              Response link from viewer
-              <input
-                value={responseInput}
-                onChange={(event) => setResponseInput(event.target.value)}
-                placeholder="Paste the response link they send back."
-              />
-              <button type="button" onClick={() => void acceptResponseLink(responseInput)}>
-                <BadgeCheck size={14} />
-                Finish Connection
-              </button>
-            </label>
+            <div className="connected-peers">
+              <span className="section-title">Connected Viewers ({room.connectedPeers.length})</span>
+              {room.connectedPeers.length === 0 ? (
+                <div className="empty-peers">No viewers connected yet.</div>
+              ) : (
+                <ul className="peer-list">
+                  {room.connectedPeers.map((peer, idx) => (
+                    <li key={peer} className="peer-item">
+                      <span className="peer-status-dot" />
+                      <span className="peer-id">{peer}</span>
+                      <span className="peer-label">{peer.startsWith("SP-GUEST") ? `Viewer (${peer.slice(9)})` : `Peer ${idx + 1}`}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
 
-            {responseLink ? (
-              <label className="signal-box signal-box--compact">
-                Your response link
-                <input readOnly value={responseLink} />
-                <button type="button" onClick={() => copyText(responseLink)}>
-                  <RotateCcw size={14} />
-                  Copy Response Link
-                </button>
-              </label>
-            ) : null}
-
-            <button type="button" onClick={publishSnapshot}>
+            <button type="button" onClick={publishSnapshot} style={{ marginTop: "1.2rem" }}>
               <CircleDot size={15} />
               Send Current Playback State
             </button>
@@ -870,7 +1076,16 @@ export function App() {
       </section>
 
       <footer className="bottom-console">
-        <Panel title="Activity Log" icon={<Activity size={15} />}>
+        <Panel
+          title="Activity Log"
+          icon={<Activity size={15} />}
+          action={
+            <button type="button" className="panel__btn" onClick={copyActivityLogs}>
+              <Clipboard size={12} />
+              Copy Logs
+            </button>
+          }
+        >
           <div className="log-list">
             {activity.map((entry) => (
               <div className={cx("log-entry", `log-entry--${entry.level}`)} key={entry.id}>

@@ -769,3 +769,115 @@ textarea {
     margin-top: 0.4rem;
   }
 }
+
+.status-band--error {
+  background: rgba(255, 92, 122, 0.08);
+  border: 1px solid rgba(255, 92, 122, 0.45);
+  color: var(--danger);
+  box-shadow: 0 0 15px rgba(255, 92, 122, 0.05);
+}
+
+.brand__badge {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(138, 247, 211, 0.1);
+  border: 1px solid rgba(138, 247, 211, 0.55);
+  color: var(--accent-2);
+  font-size: 0.62rem;
+  font-weight: 700;
+  padding: 0.1rem 0.35rem;
+  border-radius: 2px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-top: 0.15rem;
+}
+
+.panel__btn {
+  background: rgba(55, 243, 255, 0.05);
+  border: 1px solid rgba(55, 243, 255, 0.25);
+  color: var(--accent);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 0.15rem 0.45rem;
+  border-radius: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  transition: all 0.2s ease-in-out;
+  white-space: nowrap;
+}
+
+.panel__btn:hover {
+  background: rgba(55, 243, 255, 0.12);
+  border-color: var(--accent);
+  box-shadow: 0 0 8px rgba(55, 243, 255, 0.25);
+}
+
+/* Peer List Styling */
+.connected-peers {
+  margin-top: 1.2rem;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 1rem;
+}
+
+.connected-peers .section-title {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 0.6rem;
+}
+
+.empty-peers {
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-style: italic;
+  padding: 0.4rem 0;
+}
+
+.peer-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.peer-item {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  background: rgba(55, 243, 255, 0.03);
+  border: 1px solid var(--line-soft);
+  padding: 0.45rem 0.65rem;
+  border-radius: 3px;
+  font-size: 0.72rem;
+}
+
+.peer-status-dot {
+  width: 6px;
+  height: 6px;
+  background: var(--accent-2);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--accent-2);
+  animation: rtc-pulse 2s infinite ease-in-out;
+}
+
+.peer-id {
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.peer-label {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.65rem;
+}
+
+
