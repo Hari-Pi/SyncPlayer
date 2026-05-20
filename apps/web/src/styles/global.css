@@ -666,3 +666,106 @@ textarea {
     grid-template-columns: 1fr;
   }
 }
+
+/* --- Connection Status Band Styles --- */
+.status-band {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 0.85rem;
+  padding: 0.85rem 1.2rem;
+  border-radius: 4px;
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  line-height: 1.45;
+  transition: all 0.2s ease-in-out;
+}
+
+.status-band--info {
+  background: rgba(55, 243, 255, 0.08);
+  border: 1px solid rgba(55, 243, 255, 0.45);
+  color: var(--text);
+  box-shadow: 0 0 15px rgba(55, 243, 255, 0.05);
+}
+
+.status-band--warn {
+  background: rgba(255, 180, 84, 0.08);
+  border: 1px solid rgba(255, 180, 84, 0.45);
+  color: var(--warn);
+  box-shadow: 0 0 15px rgba(255, 180, 84, 0.05);
+}
+
+.status-band--success {
+  background: rgba(138, 247, 211, 0.08);
+  border: 1px solid rgba(138, 247, 211, 0.45);
+  color: var(--accent-2);
+  box-shadow: 0 0 15px rgba(138, 247, 211, 0.05);
+}
+
+.status-band__content {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.85rem;
+  flex: 1;
+}
+
+.status-band__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 0.12rem;
+}
+
+.status-band__icon--pulse {
+  animation: rtc-pulse 2s infinite ease-in-out;
+}
+
+.status-band__text-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.status-band__title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.status-band__desc {
+  opacity: 0.9;
+  font-size: 0.76rem;
+}
+
+.status-band__actions {
+  display: flex;
+  gap: 0.6rem;
+  flex-shrink: 0;
+  align-items: center;
+}
+
+.status-band__btn {
+  font-size: 0.72rem;
+  min-height: 2rem;
+  padding: 0.4rem 0.75rem;
+}
+
+@keyframes rtc-pulse {
+  0% { opacity: 0.6; transform: scale(0.96); }
+  50% { opacity: 1; transform: scale(1.04); }
+  100% { opacity: 0.6; transform: scale(0.96); }
+}
+
+@media (max-width: 760px) {
+  .status-band {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 0.8rem;
+  }
+  .status-band__actions {
+    justify-content: flex-start;
+    margin-top: 0.4rem;
+  }
+}

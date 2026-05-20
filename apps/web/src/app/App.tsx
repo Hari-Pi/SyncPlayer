@@ -139,6 +139,7 @@ export function App() {
   const [responseLink, setResponseLink] = useState("");
   const [responseInput, setResponseInput] = useState("");
   const [localTabPeer, setLocalTabPeer] = useState("No local tab");
+  const [openedThroughRoomLink, setOpenedThroughRoomLink] = useState(false);
   const handledShareLinkRef = useRef(false);
   const localTabChannelRef = useRef<ReturnType<typeof createLocalTabChannel>>(null);
   const [activity, setActivity] = useState<ActivityEntry[]>([
@@ -369,6 +370,7 @@ export function App() {
     handledShareLinkRef.current = true;
 
     if (payload.type === "invite") {
+      setOpenedThroughRoomLink(true);
       if (payload.media?.origin === "remote-url") {
         mountRemoteMedia(payload.media.sourceUrl, "invite");
       }
@@ -608,6 +610,80 @@ export function App() {
         <div className="warning-band">
           Mobile Firefox may block WebRTC on this LAN HTTP address. The page can load, but peer sync may fail until the
           app is opened from a secure origin.
+        </div>
+      ) : null}
+
+      {room.status === "connected" ? (
+        <div className="status-band status-band--success">
+          <div className="status-band__content">
+            <div className="status-band__icon status-band__icon--pulse">
+              <RadioTower size={18} />
+            </div>
+            <div className="status-band__text-group">
+              <span className="status-band__title">Live Session Synchronized</span>
+              <span className="status-band__desc">
+                {room.role === "guest"
+                  ? `Connected to Host (${room.remotePeer}). Your playback is locked to the host's timeline. Delay is ${room.latencyMs}ms.`
+                  : `Hosting Active Room with Viewer (${room.remotePeer}). Broadcast stream running. Peer latency is ${room.latencyMs}ms.`}
+              </span>
+            </div>
+          </div>
+          <div className="status-band__actions">
+            <button type="button" className="status-band__btn" onClick={publishSnapshot}>
+              Force Sync State
+            </button>
+            <button type="button" className="status-band__btn" onClick={room.closeRoom}>
+              Disconnect
+            </button>
+          </div>
+        </div>
+      ) : room.role === "guest" ? (
+        <div className="status-band status-band--warn">
+          <div className="status-band__content">
+            <div className="status-band__icon">
+              <Link2 size={18} />
+            </div>
+            <div className="status-band__text-group">
+              <span className="status-band__title">Invite Link Loaded — Handshake Required</span>
+              <span className="status-band__desc">
+                You have joined via room link. We copied your <strong>Response Link</strong> to your clipboard. Send this Response Link back to the Host so they can finish connecting your timelines!
+              </span>
+            </div>
+          </div>
+          <div className="status-band__actions">
+            {responseLink ? (
+              <button type="button" className="status-band__btn primary-action" onClick={() => copyText(responseLink)}>
+                <Clipboard size={14} />
+                Copy Response Link
+              </button>
+            ) : null}
+            <button type="button" className="status-band__btn" onClick={room.closeRoom}>
+              Cancel Join
+            </button>
+          </div>
+        </div>
+      ) : room.role === "host" && inviteLink ? (
+        <div className="status-band status-band--info">
+          <div className="status-band__content">
+            <div className="status-band__icon status-band__icon--pulse">
+              <Radar size={18} />
+            </div>
+            <div className="status-band__text-group">
+              <span className="status-band__title">Awaiting Viewer Response</span>
+              <span className="status-band__desc">
+                Room invite is copied to your clipboard. Send it to your viewer. When they open it, they will give you a Response Link. Paste it into the "Response link from viewer" input below to connect.
+              </span>
+            </div>
+          </div>
+          <div className="status-band__actions">
+            <button type="button" className="status-band__btn primary-action" onClick={() => copyText(inviteLink)}>
+              <Clipboard size={14} />
+              Copy Invite Link
+            </button>
+            <button type="button" className="status-band__btn" onClick={room.closeRoom}>
+              Cancel Room
+            </button>
+          </div>
         </div>
       ) : null}
 

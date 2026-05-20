@@ -10,7 +10,14 @@ type PeerRoomOptions = {
 };
 
 const rtcConfig: RTCConfiguration = {
-  iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:global.stun.twilio.com:3478" }]
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun3.l.google.com:19302" },
+    { urls: "stun:stun4.l.google.com:19302" },
+    { urls: "stun:stun.services.mozilla.com" }
+  ]
 };
 
 function encodeDescription(description: RTCSessionDescription | RTCSessionDescriptionInit | null) {
@@ -41,7 +48,7 @@ async function waitForIceGathering(peer: RTCPeerConnection) {
   }
 
   await new Promise<void>((resolve) => {
-    const timeout = window.setTimeout(resolve, 2200);
+    const timeout = window.setTimeout(resolve, 6000);
 
     peer.addEventListener("icegatheringstatechange", () => {
       if (peer.iceGatheringState === "complete") {
