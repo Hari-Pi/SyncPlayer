@@ -24,11 +24,12 @@ import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "
 import Artplayer from "artplayer";
 import { createActivity, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
 import { usePeerRoom } from "@/features/room/usePeerRoom";
-import { createMediaHint, loadSyncCore, readDrift, type DriftReading } from "@/lib/wasm/syncCore";
+import { createMediaHint, loadSyncCore, readDrift, quantisePositionSync, type DriftReading } from "@/lib/wasm/syncCore";
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
 import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia } from "@/lib/media/mediaTypes";
 import { createLocalTabChannel } from "@/lib/sync/localTabSync";
-import type { PlaybackSnapshot } from "@/lib/webrtc/messages";
+import type { PlaybackSnapshot, FileMeta } from "@/lib/webrtc/messages";
+import type { FileStreamHandlers } from "@/features/room/usePeerRoom";
 
 const emptyDrift: DriftReading = {
   driftMs: 0,
@@ -155,6 +156,11 @@ export function App() {
   const localTabChannelRef = useRef<ReturnType<typeof createLocalTabChannel>>(null);
   const roleRef = useRef<"solo" | "host" | "guest">("solo");
   const manualPauseTimesRef = useRef<number[]>([]);
+  const hostFileRef = useRef<File | null>(null);
+  const guestMseRef = useRef<{ ms: MediaSource; sb: SourceBuffer; queue: ArrayBuffer[]; updating: boolean } | null>(null);
+  const guestBlobChunksRef = useRef<number[][]>([]);
+  const [guestStreamUrl, setGuestStreamUrl] = useState<string | null>(null);
+  const [guestStreamMeta, setGuestStreamMeta] = useState<FileMeta | null>(null);
   const [activity, setActivity] = useState<ActivityEntry[]>([
     createActivity("info", "BOOT", "Command deck initialized.")
   ]);
@@ -204,7 +210,7 @@ export function App() {
       remoteApplyRef.current = true;
 
       if (reading.mode === "seek" || reading.mode === "firm") {
-        element.currentTime = remoteSnapshot.position + latencyMs / 1000;
+        element.currentTime = quantisePositionSync(remoteSnapshot.position + latencyMs / 1000, 30);
       } else if (reading.mode === "soft") {
         element.playbackRate = reading.rate;
       } else {
@@ -226,9 +232,100 @@ export function App() {
     [log] // stable: reads live media via mediaStateRef, not the closed-over state
   );
 
+  // ── Guest file stream receiver ─────────────────────────────────────────────
+  const handleFileStream = useCallback((meta: FileMeta): FileStreamHandlers => {
+    setGuestStreamMeta(meta);
+    log("info", "FILE", `Receiving "${meta.fileName}" (${(meta.fileSize / 1024 / 1024).toFixed(1)} MB) — ${meta.isBlob ? "full blob" : "MSE stream"} mode`);
+
+    // Set up the media state on the guest side so mediaId matches the host
+    const kind = inferMediaKind(meta.mimeType || meta.fileName);
+    setMedia({
+      id: meta.mediaId,
+      title: meta.fileName,
+      sourceUrl: "", // will be replaced when stream is ready
+      kind,
+      format: inferMediaFormat(meta.mimeType || meta.fileName),
+      origin: "remote-url",
+      sizeBytes: meta.fileSize
+    });
+
+    if (!meta.isBlob) {
+      // MSE progressive path — start playing immediately
+      const ms = new MediaSource();
+      const url = URL.createObjectURL(ms);
+
+      ms.addEventListener("sourceopen", () => {
+        let sb: SourceBuffer;
+        try { sb = ms.addSourceBuffer(meta.mimeType); }
+        catch { try { sb = ms.addSourceBuffer("video/mp4"); } catch { return; } }
+
+        const state = { ms, sb, queue: [] as ArrayBuffer[], updating: false };
+        guestMseRef.current = state;
+
+        const flush = () => {
+          if (state.updating || state.sb.updating || state.queue.length === 0) return;
+          const chunk = state.queue.shift()!;
+          state.updating = true;
+          try { state.sb.appendBuffer(chunk); } catch { state.updating = false; }
+        };
+
+        sb.addEventListener("updateend", () => { state.updating = false; flush(); });
+      }, { once: true });
+
+      setGuestStreamUrl(url);
+      setMedia((prev) => prev ? { ...prev, sourceUrl: url } : prev);
+
+      return {
+        onChunk: (_index, _total, data) => {
+          const state = guestMseRef.current;
+          if (!state) return;
+          const chunk = new ArrayBuffer(data.byteLength);
+          new Uint8Array(chunk).set(data);
+          state.queue.push(chunk);
+          if (!state.sb.updating && !state.updating) {
+            const chunk = state.queue.shift()!;
+            state.updating = true;
+            try { state.sb.appendBuffer(chunk); } catch { state.updating = false; }
+          }
+        },
+        onEnd: () => {
+          const tryEnd = () => {
+            const state = guestMseRef.current;
+            if (!state) return;
+            if (state.queue.length === 0 && !state.sb.updating) {
+              try { state.ms.endOfStream(); } catch { /* ignore */ }
+              setGuestStreamMeta(null);
+              guestMseRef.current = null;
+            } else { setTimeout(tryEnd, 150); }
+          };
+          tryEnd();
+        }
+      };
+    } else {
+      // Full blob path — accumulate then mount (MKV etc.)
+      guestBlobChunksRef.current = [];
+      return {
+        onChunk: (index, _total, data) => {
+          guestBlobChunksRef.current[index] = Array.from(data);
+        },
+        onEnd: () => {
+          const flat = ([] as number[]).concat(...guestBlobChunksRef.current);
+          const blob = new Blob([new Uint8Array(flat)], { type: meta.mimeType || "video/x-matroska" });
+          const url = URL.createObjectURL(blob);
+          guestBlobChunksRef.current = [];
+          setGuestStreamUrl(url);
+          setMedia((prev) => prev ? { ...prev, sourceUrl: url } : prev);
+          setGuestStreamMeta(null);
+          log("ok", "FILE", `"${meta.fileName}" received and mounted for playback.`);
+        }
+      };
+    }
+  }, [log]);
+
   const room = usePeerRoom({
     onPlaybackState: handleRemotePlayback,
-    onEvent: log
+    onEvent: log,
+    onFileStream: handleFileStream
   });
 
   useEffect(() => {
@@ -304,7 +401,7 @@ export function App() {
     copyText(nextInviteLink);
 
     if (media?.origin === "local-file") {
-      log("warn", "SHARE", "Invite link created. Local file transfer is not active yet, so the viewer will need the same file.");
+      log("ok", "SHARE", "Invite link copied. The file will stream to viewers automatically when they connect.");
     } else if (shareableMedia) {
       log("ok", "SHARE", "Invite link copied. The media URL will load for the viewer.");
     } else {
@@ -530,6 +627,7 @@ export function App() {
         return;
       }
 
+      hostFileRef.current = file;
       const sourceUrl = URL.createObjectURL(file);
       const id = await createMediaHint(file.size, 0, file.lastModified);
 
@@ -545,9 +643,29 @@ export function App() {
       });
       setDrift(emptyDrift);
       log("ok", "MEDIA", `${file.name} mounted as local source.`);
+
+      // If already hosting a connected room, stream immediately to all peers
+      if (room.role === "host" && room.connectedPeers.length > 0) {
+        log("info", "FILE", `Streaming "${file.name}" to ${room.connectedPeers.length} connected peer(s)...`);
+        void room.sendFile(file, id);
+      }
     },
-    [log]
+    [log, room]
   );
+
+  // Late-join re-stream: when a new peer connects while host already has a local file
+  const prevConnectedPeersRef = useRef<string[]>([]);
+  useEffect(() => {
+    const prev = prevConnectedPeersRef.current;
+    const curr = room.connectedPeers;
+    const newPeers = curr.filter((p) => !prev.includes(p));
+    prevConnectedPeersRef.current = curr;
+
+    if (newPeers.length > 0 && room.role === "host" && hostFileRef.current && mediaStateRef.current?.origin === "local-file") {
+      log("info", "FILE", `New peer(s) connected: ${newPeers.join(", ")}. Streaming local file to them...`);
+      void room.sendFile(hostFileRef.current, mediaStateRef.current.id);
+    }
+  }, [room.connectedPeers, room.role, room, log]);
 
   const handleRemoteUrl = useCallback(async () => {
     const url = remoteUrl.trim();
@@ -997,6 +1115,21 @@ export function App() {
 
           <Panel title="Playback Surface" icon={<Video size={15} />} className="player-panel">
             <div className="player-shell">
+              {/* Guest receive progress bar */}
+              {guestStreamMeta && (
+                <div className="stream-progress-wrap">
+                  <div className="stream-progress-label">
+                    <span>{guestStreamMeta.isBlob ? "Receiving file" : "Streaming"}: <strong>{guestStreamMeta.fileName}</strong></span>
+                    <span>{room.fileReceiveProgress ? `${Math.round((room.fileReceiveProgress.chunksReceived / room.fileReceiveProgress.total) * 100)}%` : ""}</span>
+                  </div>
+                  <div className="stream-progress-bar">
+                    <div
+                      className="stream-progress-bar__fill"
+                      style={{ width: room.fileReceiveProgress ? `${(room.fileReceiveProgress.chunksReceived / room.fileReceiveProgress.total) * 100}%` : "0%" }}
+                    />
+                  </div>
+                </div>
+              )}
               {media ? (
                 media.kind === "audio" ? (
                   <div className="audio-stage">
@@ -1023,8 +1156,8 @@ export function App() {
               ) : (
                 <div className="empty-player">
                   <ScanLine size={54} />
-                  <strong>Mount media to begin</strong>
-                  <span>Local files stay on this device. Peers only receive sync state.</span>
+                  <strong>{guestStreamMeta ? `Receiving "${guestStreamMeta.fileName}"...` : "Mount media to begin"}</strong>
+                  <span>{guestStreamMeta ? `${guestStreamMeta.isBlob ? "Full file transfer" : "MSE progressive stream"} in progress` : "Local files stream to viewers automatically over P2P."}</span>
                 </div>
               )}
             </div>
@@ -1051,12 +1184,21 @@ export function App() {
               </p>
             </div>
 
-            {media?.origin === "local-file" ? (
-              <div className="helper-copy helper-copy--warn">
-                Local files are private to this device right now. The link connects playback, but the viewer still needs
-                the same file until P2P file transfer is added.
+            {/* Host send progress bar */}
+            {room.fileSendProgress && (
+              <div className="stream-progress-wrap">
+                <div className="stream-progress-label">
+                  <span>Streaming to peers: <strong>{room.fileSendProgress.fileName}</strong></span>
+                  <span>{Math.round((room.fileSendProgress.chunksSent / room.fileSendProgress.total) * 100)}%</span>
+                </div>
+                <div className="stream-progress-bar">
+                  <div
+                    className="stream-progress-bar__fill"
+                    style={{ width: `${(room.fileSendProgress.chunksSent / room.fileSendProgress.total) * 100}%` }}
+                  />
+                </div>
               </div>
-            ) : null}
+            )}
 
             <label className="signal-box signal-box--compact">
               Invite link to send
