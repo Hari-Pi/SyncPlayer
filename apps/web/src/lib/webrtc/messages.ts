@@ -16,6 +16,15 @@ export type FileMeta = {
   totalChunks: number;
 };
 
+export type RemoteMediaMount = {
+  id: string;
+  title: string;
+  sourceUrl: string;
+  kind: "audio" | "video" | "unknown";
+  format: "direct" | "hls" | "dash" | "unknown";
+  origin: "remote-url";
+};
+
 export type WireMessage =
   | {
       id: string;
@@ -55,10 +64,15 @@ export type WireMessage =
         mediaId: string;
         index: number;
         total: number;
-        /** Uint8Array serialised as number[] for JSON transport */
-        data: number[];
+        data: Uint8Array;
         checksum: string;
       };
+    }
+  | {
+      id: string;
+      type: "media.mount";
+      sentAt: number;
+      payload: RemoteMediaMount;
     }
   | {
       id: string;

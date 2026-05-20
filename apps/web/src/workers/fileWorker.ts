@@ -43,7 +43,7 @@ type WorkerInMessage =
 
 export type WorkerOutMessage =
   | { type: "ready" }
-  | { type: "chunk"; mediaId: string; index: number; total: number; data: number[]; checksum: string }
+  | { type: "chunk"; mediaId: string; index: number; total: number; data: Uint8Array; checksum: string }
   | { type: "end"; mediaId: string; checksum: string }
   | { type: "error"; message: string }
   | { type: "progress"; index: number; total: number };
@@ -96,9 +96,9 @@ self.onmessage = async (event: MessageEvent<WorkerInMessage>) => {
         mediaId,
         index,
         total,
-        data: Array.from(bytes),
+        data: bytes,
         checksum
-      } satisfies WorkerOutMessage);
+      } satisfies WorkerOutMessage, [bytes.buffer]);
 
       // Progress report every 16 chunks (~1 MB at 64 KB chunk size)
       if (index % 16 === 0 || index === total - 1) {

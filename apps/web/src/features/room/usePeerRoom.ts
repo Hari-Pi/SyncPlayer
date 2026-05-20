@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Peer, DataConnection, type PeerJSOption } from "peerjs";
-import type { PlaybackSnapshot, WireMessage, FileMeta } from "@/lib/webrtc/messages";
+import type { PlaybackSnapshot, WireMessage, FileMeta, RemoteMediaMount } from "@/lib/webrtc/messages";
 import { smoothLatencySync } from "@/lib/wasm/syncCore";
 
 type RoomRole = "solo" | "host" | "guest";
@@ -32,6 +32,7 @@ type PeerRoomOptions = {
   onPlaybackState: (snapshot: PlaybackSnapshot, latencyMs: number) => void;
   onEvent: (level: "info" | "ok" | "warn" | "error", label: string, detail: string) => void;
   onFileStream?: (meta: FileMeta) => FileStreamHandlers;
+  onMediaMount?: (media: RemoteMediaMount) => void;
 };
 
 function readStoredPeerOptions() {
@@ -205,16 +206,25 @@ const FLOW_HIGH_WATERMARK = 4 * 1024 * 1024;
 // Resume when it drains below 256 KB
 const FLOW_LOW_WATERMARK = 256 * 1024;
 
+function getDataChannel(conn: DataConnection) {
+  return conn.dataChannel ?? (conn as unknown as { _dc?: RTCDataChannel })._dc ?? null;
+}
+
 /** Wait until conn's bufferedAmount drops below the low watermark. */
 function waitForDrain(conn: DataConnection): Promise<void> {
   return new Promise((resolve) => {
-    const channel = (conn as unknown as { _dc?: RTCDataChannel })._dc;
-    if (!channel || channel.bufferedAmount < FLOW_LOW_WATERMARK) {
+    const channel = getDataChannel(conn);
+    const peerBufferSize = (conn as unknown as { bufferSize?: number }).bufferSize ?? 0;
+    if (!channel || (channel.bufferedAmount < FLOW_LOW_WATERMARK && peerBufferSize === 0)) {
       resolve();
       return;
     }
+
+    channel.bufferedAmountLowThreshold = FLOW_LOW_WATERMARK;
     const interval = setInterval(() => {
-      if (!channel || channel.bufferedAmount < FLOW_LOW_WATERMARK) {
+      const buffered = channel.bufferedAmount;
+      const queued = (conn as unknown as { bufferSize?: number }).bufferSize ?? 0;
+      if (buffered < FLOW_LOW_WATERMARK && queued === 0) {
         clearInterval(interval);
         resolve();
       }
@@ -222,7 +232,7 @@ function waitForDrain(conn: DataConnection): Promise<void> {
   });
 }
 
-export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoomOptions) {
+export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMount }: PeerRoomOptions) {
   const [role, setRole] = useState<RoomRole>("solo");
   const [status, setStatus] = useState<LinkStatus>("idle");
   const [localOffer, setLocalOffer] = useState("");
@@ -241,9 +251,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
   const onPlaybackStateRef = useRef(onPlaybackState);
   const onEventRef = useRef(onEvent);
   const onFileStreamRef = useRef(onFileStream);
+  const onMediaMountRef = useRef(onMediaMount);
   useEffect(() => { onPlaybackStateRef.current = onPlaybackState; }, [onPlaybackState]);
   useEffect(() => { onEventRef.current = onEvent; }, [onEvent]);
   useEffect(() => { onFileStreamRef.current = onFileStream; }, [onFileStream]);
+  useEffect(() => { onMediaMountRef.current = onMediaMount; }, [onMediaMount]);
 
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<DataConnection[]>([]);
@@ -318,6 +330,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
     [send]
   );
 
+  const sendMediaMount = useCallback(
+    (media: RemoteMediaMount) => { send("media.mount", media); },
+    [send]
+  );
+
   const latencyMsRef = useRef(latencyMs);
   useEffect(() => { latencyMsRef.current = latencyMs; }, [latencyMs]);
 
@@ -336,6 +353,12 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
 
       if (message.type === "playback.state") {
         onPlaybackStateRef.current(message.payload, latencyMsRef.current);
+        return;
+      }
+
+      if (message.type === "media.mount") {
+        onMediaMountRef.current?.(message.payload);
+        onEventRef.current("ok", "MEDIA", `Host mounted URL media: ${message.payload.title}.`);
         return;
       }
 
@@ -378,7 +401,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
         const { mediaId, index, total, data, checksum } = message.payload;
         const handlers = fileStreamHandlersRef.current.get(mediaId);
         if (handlers) {
-          const bytes = new Uint8Array(data);
+          const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
           handlers.onChunk(index, total, bytes, checksum);
           const received = index + 1;
           setFileReceiveProgress((prev) =>
@@ -422,12 +445,9 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
       if (conns.length === 0) return;
 
       const mimeType = file.type || "video/mp4";
-      const isMseFriendly =
-        typeof MediaSource !== "undefined" &&
-        MediaSource.isTypeSupported(mimeType) &&
-        !file.name.toLowerCase().endsWith(".mkv") &&
-        !file.name.toLowerCase().endsWith(".avi") &&
-        !file.name.toLowerCase().endsWith(".wmv");
+      // Arbitrary local files are not guaranteed to be valid MSE segments when sliced
+      // by byte range, so transfer them as a complete Blob and mount after receipt.
+      const isMseFriendly = false;
 
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
       const meta: FileMeta = {
@@ -457,37 +477,28 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
         { type: "module" }
       );
 
-      const chunkQueue: Array<{ index: number; total: number; data: number[]; checksum: string }> = [];
+      const chunkQueue: Array<{ index: number; total: number; data: Uint8Array; checksum: string }> = [];
       let workerDone = false;
       let workerError: string | null = null;
+      let finalChecksum: string | null = null;
+      let drainActive = false;
+      let endSent = false;
 
       await new Promise<void>((resolve, reject) => {
-        worker.onmessage = async (event: MessageEvent) => {
-          const msg = event.data as { type: string; [k: string]: unknown };
+        const rejectTransfer = (error: unknown) => {
+          reject(error);
+        };
 
-          if (msg.type === "ready") return;
+        const drainQueue = async () => {
+          if (drainActive) return;
+          drainActive = true;
 
-          if (msg.type === "error") {
-            workerError = msg.message as string;
-            reject(new Error(workerError));
-            return;
-          }
-
-          if (msg.type === "chunk") {
-            chunkQueue.push({
-              index: msg.index as number,
-              total: msg.total as number,
-              data: msg.data as number[],
-              checksum: msg.checksum as string
-            });
-
-            // Drain the queue — send chunk to each connection with flow control
+          try {
             while (chunkQueue.length > 0) {
               const chunk = chunkQueue.shift()!;
               for (const conn of conns) {
                 if (!conn.open) continue;
-                // Flow control: wait if the channel is overwhelmed
-                const channel = (conn as unknown as { _dc?: RTCDataChannel })._dc;
+                const channel = getDataChannel(conn);
                 if (channel && channel.bufferedAmount > FLOW_HIGH_WATERMARK) {
                   await waitForDrain(conn);
                 }
@@ -503,6 +514,47 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
                 prev ? { ...prev, chunksSent: chunk.index + 1 } : prev
               );
             }
+
+            if (workerDone && finalChecksum && !endSent) {
+              endSent = true;
+              for (const conn of conns) {
+                if (!conn.open) continue;
+                await waitForDrain(conn);
+                sendToOne(conn, "file.end", { mediaId, checksum: finalChecksum });
+                await waitForDrain(conn);
+              }
+              onEventRef.current("ok", "FILE", `File "${file.name}" fully sent. Checksum: ${finalChecksum}`);
+              resolve();
+            }
+          } catch (error) {
+            rejectTransfer(error);
+          } finally {
+            drainActive = false;
+            if (chunkQueue.length > 0 || (workerDone && finalChecksum && !endSent)) {
+              void drainQueue();
+            }
+          }
+        };
+
+        worker.onmessage = (event: MessageEvent) => {
+          const msg = event.data as { type: string; [k: string]: unknown };
+
+          if (msg.type === "ready") return;
+
+          if (msg.type === "error") {
+            workerError = msg.message as string;
+            reject(new Error(workerError));
+            return;
+          }
+
+          if (msg.type === "chunk") {
+            chunkQueue.push({
+              index: msg.index as number,
+              total: msg.total as number,
+              data: msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data as ArrayLike<number>),
+              checksum: msg.checksum as string
+            });
+            void drainQueue();
           }
 
           if (msg.type === "progress") {
@@ -513,14 +565,10 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
           }
 
           if (msg.type === "end") {
-            const checksum = msg.checksum as string;
-            conns.forEach((conn) => {
-              if (conn.open) sendToOne(conn, "file.end", { mediaId, checksum });
-            });
-            onEventRef.current("ok", "FILE", `File "${file.name}" fully sent. Checksum: ${checksum}`);
+            finalChecksum = msg.checksum as string;
             workerDone = true;
             worker.terminate();
-            resolve();
+            void drainQueue();
           }
         };
 
@@ -754,6 +802,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream }: PeerRoom
     closeRoom,
     pingPeer,
     sendPlaybackState,
+    sendMediaMount,
     sendFile
   };
 }

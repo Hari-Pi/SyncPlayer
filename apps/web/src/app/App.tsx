@@ -28,7 +28,7 @@ import { createMediaHint, loadSyncCore, readDrift, quantisePositionSync, type Dr
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
 import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia } from "@/lib/media/mediaTypes";
 import { createLocalTabChannel } from "@/lib/sync/localTabSync";
-import type { PlaybackSnapshot, FileMeta } from "@/lib/webrtc/messages";
+import type { PlaybackSnapshot, FileMeta, RemoteMediaMount } from "@/lib/webrtc/messages";
 import type { FileStreamHandlers } from "@/features/room/usePeerRoom";
 
 const emptyDrift: DriftReading = {
@@ -163,6 +163,20 @@ function getIceServerUrls(server: RTCIceServer | null) {
   return Array.isArray(server.urls) ? server.urls.join("\n") : server.urls;
 }
 
+function createRemoteMedia(url: string): LoadedMedia {
+  const parsedUrl = new URL(url);
+  const format = inferMediaFormat(url);
+
+  return {
+    id: `url:${url}`,
+    title: parsedUrl.pathname.split("/").pop() || "Remote stream",
+    sourceUrl: url,
+    kind: inferMediaKind(url),
+    format,
+    origin: "remote-url"
+  };
+}
+
 export function App() {
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const artplayerContainerRef = useRef<HTMLDivElement | null>(null);
@@ -197,7 +211,7 @@ export function App() {
   const manualPauseTimesRef = useRef<number[]>([]);
   const hostFileRef = useRef<File | null>(null);
   const guestMseRef = useRef<{ ms: MediaSource; sb: SourceBuffer; queue: ArrayBuffer[]; updating: boolean } | null>(null);
-  const guestBlobChunksRef = useRef<number[][]>([]);
+  const guestBlobChunksRef = useRef<ArrayBuffer[]>([]);
   const [guestStreamUrl, setGuestStreamUrl] = useState<string | null>(null);
   const [guestStreamMeta, setGuestStreamMeta] = useState<FileMeta | null>(null);
   const [activity, setActivity] = useState<ActivityEntry[]>([
@@ -273,6 +287,12 @@ export function App() {
 
   // ── Guest file stream receiver ─────────────────────────────────────────────
   const handleFileStream = useCallback((meta: FileMeta): FileStreamHandlers => {
+    setGuestStreamUrl((previousUrl) => {
+      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      return null;
+    });
+    guestMseRef.current = null;
+    guestBlobChunksRef.current = [];
     setGuestStreamMeta(meta);
     log("info", "FILE", `Receiving "${meta.fileName}" (${(meta.fileSize / 1024 / 1024).toFixed(1)} MB) — ${meta.isBlob ? "full blob" : "MSE stream"} mode`);
 
@@ -292,6 +312,10 @@ export function App() {
       // MSE progressive path — start playing immediately
       const ms = new MediaSource();
       const url = URL.createObjectURL(ms);
+      const pendingChunks: ArrayBuffer[] = [];
+      let appendChunk = (chunk: ArrayBuffer) => {
+        pendingChunks.push(chunk);
+      };
 
       ms.addEventListener("sourceopen", () => {
         let sb: SourceBuffer;
@@ -309,6 +333,11 @@ export function App() {
         };
 
         sb.addEventListener("updateend", () => { state.updating = false; flush(); });
+        appendChunk = (chunk) => {
+          state.queue.push(chunk);
+          flush();
+        };
+        pendingChunks.splice(0).forEach(appendChunk);
       }, { once: true });
 
       setGuestStreamUrl(url);
@@ -316,21 +345,17 @@ export function App() {
 
       return {
         onChunk: (_index, _total, data) => {
-          const state = guestMseRef.current;
-          if (!state) return;
           const chunk = new ArrayBuffer(data.byteLength);
           new Uint8Array(chunk).set(data);
-          state.queue.push(chunk);
-          if (!state.sb.updating && !state.updating) {
-            const chunk = state.queue.shift()!;
-            state.updating = true;
-            try { state.sb.appendBuffer(chunk); } catch { state.updating = false; }
-          }
+          appendChunk(chunk);
         },
         onEnd: () => {
           const tryEnd = () => {
             const state = guestMseRef.current;
-            if (!state) return;
+            if (!state) {
+              setTimeout(tryEnd, 150);
+              return;
+            }
             if (state.queue.length === 0 && !state.sb.updating) {
               try { state.ms.endOfStream(); } catch { /* ignore */ }
               setGuestStreamMeta(null);
@@ -345,11 +370,12 @@ export function App() {
       guestBlobChunksRef.current = [];
       return {
         onChunk: (index, _total, data) => {
-          guestBlobChunksRef.current[index] = Array.from(data);
+          const chunk = new ArrayBuffer(data.byteLength);
+          new Uint8Array(chunk).set(data);
+          guestBlobChunksRef.current[index] = chunk;
         },
         onEnd: () => {
-          const flat = ([] as number[]).concat(...guestBlobChunksRef.current);
-          const blob = new Blob([new Uint8Array(flat)], { type: meta.mimeType || "video/x-matroska" });
+          const blob = new Blob(guestBlobChunksRef.current, { type: meta.mimeType || "video/x-matroska" });
           const url = URL.createObjectURL(blob);
           guestBlobChunksRef.current = [];
           setGuestStreamUrl(url);
@@ -361,10 +387,47 @@ export function App() {
     }
   }, [log]);
 
+  const mountRemoteMedia = useCallback(
+    (url: string, source: "manual" | "invite") => {
+      let nextMedia: LoadedMedia;
+
+      try {
+        nextMedia = createRemoteMedia(url);
+      } catch {
+        log("error", "MEDIA", "That media URL is not valid.");
+        return null;
+      }
+
+      setRemoteUrl(url);
+      setMedia(nextMedia);
+      setDrift(emptyDrift);
+      hostFileRef.current = null;
+      log("ok", "MEDIA", source === "invite" ? "Media URL loaded from invite link." : `${mediaFormatLabel(nextMedia.format)} URL mounted.`);
+      return nextMedia;
+    },
+    [log]
+  );
+
+  const handleRemoteMediaMount = useCallback((nextMedia: RemoteMediaMount) => {
+    setGuestStreamUrl((previousUrl) => {
+      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      return null;
+    });
+    guestMseRef.current = null;
+    guestBlobChunksRef.current = [];
+    setGuestStreamMeta(null);
+    hostFileRef.current = null;
+    setRemoteUrl(nextMedia.sourceUrl);
+    setMedia(nextMedia);
+    setDrift(emptyDrift);
+    log("ok", "MEDIA", `${nextMedia.title} mounted from host.`);
+  }, [log]);
+
   const room = usePeerRoom({
     onPlaybackState: handleRemotePlayback,
     onEvent: log,
-    onFileStream: handleFileStream
+    onFileStream: handleFileStream,
+    onMediaMount: handleRemoteMediaMount
   });
 
   useEffect(() => {
@@ -381,35 +444,6 @@ export function App() {
           ? "Hosting Room"
           : "Start Room & Copy Invite";
   const topInviteLabel = inviteLink ? "Invite Copied" : "Copy Invite Link";
-
-  const mountRemoteMedia = useCallback(
-    (url: string, source: "manual" | "invite") => {
-      let parsedUrl: URL;
-
-      try {
-        parsedUrl = new URL(url);
-      } catch {
-        log("error", "MEDIA", "That media URL is not valid.");
-        return false;
-      }
-
-      const format = inferMediaFormat(url);
-
-      setRemoteUrl(url);
-      setMedia({
-        id: `url:${url}`,
-        title: parsedUrl.pathname.split("/").pop() || "Remote stream",
-        sourceUrl: url,
-        kind: inferMediaKind(url),
-        format,
-        origin: "remote-url"
-      });
-      setDrift(emptyDrift);
-      log("ok", "MEDIA", source === "invite" ? "Media URL loaded from invite link." : `${mediaFormatLabel(format)} URL mounted.`);
-      return true;
-    },
-    [log]
-  );
 
   const saveTurnConfig = useCallback(() => {
     const urls = turnUrls
@@ -713,6 +747,7 @@ export function App() {
       if (!file) {
         return;
       }
+      event.currentTarget.value = "";
 
       hostFileRef.current = file;
       const sourceUrl = URL.createObjectURL(file);
@@ -748,9 +783,23 @@ export function App() {
     const newPeers = curr.filter((p) => !prev.includes(p));
     prevConnectedPeersRef.current = curr;
 
-    if (newPeers.length > 0 && room.role === "host" && hostFileRef.current && mediaStateRef.current?.origin === "local-file") {
+    const currentMedia = mediaStateRef.current;
+    if (newPeers.length > 0 && room.role === "host" && hostFileRef.current && currentMedia?.origin === "local-file") {
       log("info", "FILE", `New peer(s) connected: ${newPeers.join(", ")}. Streaming local file to them...`);
-      void room.sendFile(hostFileRef.current, mediaStateRef.current.id);
+      void room.sendFile(hostFileRef.current, currentMedia.id);
+      return;
+    }
+
+    if (newPeers.length > 0 && room.role === "host" && currentMedia?.origin === "remote-url") {
+      room.sendMediaMount({
+        id: currentMedia.id,
+        title: currentMedia.title,
+        sourceUrl: currentMedia.sourceUrl,
+        kind: currentMedia.kind,
+        format: currentMedia.format,
+        origin: "remote-url"
+      });
+      log("ok", "MEDIA", `URL media sent to new viewer(s): ${newPeers.join(", ")}.`);
     }
   }, [room.connectedPeers, room.role, room, log]);
 
@@ -761,8 +810,28 @@ export function App() {
       return;
     }
 
-    mountRemoteMedia(url, "manual");
-  }, [mountRemoteMedia, remoteUrl]);
+    const nextMedia = mountRemoteMedia(url, "manual");
+    if (nextMedia && room.role === "host" && room.connectedPeers.length > 0) {
+      room.sendMediaMount({
+        id: nextMedia.id,
+        title: nextMedia.title,
+        sourceUrl: nextMedia.sourceUrl,
+        kind: nextMedia.kind,
+        format: nextMedia.format,
+        origin: "remote-url"
+      });
+      log("ok", "MEDIA", `URL media update sent to ${room.connectedPeers.length} viewer(s).`);
+    }
+  }, [log, mountRemoteMedia, remoteUrl, room]);
+
+  const handleBrandHome = useCallback(() => {
+    const baseUrl = `${window.location.origin}${window.location.pathname}`;
+    window.history.replaceState(null, "", baseUrl);
+    setOpenedThroughRoomLink(false);
+    setResponseLink("");
+    setResponseInput("");
+    log("info", "NAV", "Share URL removed from address bar.");
+  }, [log]);
 
   const publishSnapshotRef = useRef(publishSnapshot);
   const handlePauseRef = useRef(handlePause);
@@ -1001,7 +1070,7 @@ export function App() {
       <div className="scanlines" />
 
       <header className="topbar">
-        <div className="brand">
+        <button type="button" className="brand brand--button" onClick={handleBrandHome} aria-label="Go to SyncPlayer home">
           <span className="brand__mark">
             <Radar size={24} />
           </span>
@@ -1014,7 +1083,7 @@ export function App() {
             </div>
             <span>Command Deck</span>
           </div>
-        </div>
+        </button>
 
         <div className="topbar__status">
           <span>
