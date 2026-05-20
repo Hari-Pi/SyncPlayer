@@ -9,8 +9,7 @@
     "build:web": "pnpm --filter @syncplayer/web build",
     "dev": "pnpm build:wasm && pnpm --filter @syncplayer/web dev",
     "dev:https": "pnpm build:wasm && pnpm --filter @syncplayer/web dev:https",
-    "typecheck": "pnpm --filter @syncplayer/web typecheck",
-    "vercel-build": "pnpm --filter @syncplayer/web build"
+    "typecheck": "pnpm --filter @syncplayer/web typecheck"
   },
   "packageManager": "pnpm@11.1.3",
   "engines": {
