@@ -87,11 +87,13 @@ function copyText(value: string) {
 }
 
 type ShareMedia = Pick<LoadedMedia, "id" | "title" | "sourceUrl" | "kind" | "format" | "origin">;
+type ShareRtcConfig = Pick<RTCConfiguration, "iceServers" | "iceTransportPolicy">;
 type SharePayload =
   | {
       type: "invite";
       offer: string;
       media: ShareMedia | null;
+      rtcConfig?: ShareRtcConfig | null;
     }
   | {
       type: "response";
@@ -134,6 +136,33 @@ function isLocalhost() {
   return ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
 }
 
+function readStoredRtcConfig(): ShareRtcConfig | null {
+  try {
+    const stored = localStorage.getItem("syncplayer:rtcconfig");
+    return stored ? JSON.parse(stored) as ShareRtcConfig : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredRtcConfig(config: ShareRtcConfig | null) {
+  if (!config) {
+    localStorage.removeItem("syncplayer:rtcconfig");
+    return;
+  }
+
+  localStorage.setItem("syncplayer:rtcconfig", JSON.stringify(config));
+}
+
+function getPrimaryIceServer(config: ShareRtcConfig | null) {
+  return config?.iceServers?.[0] ?? null;
+}
+
+function getIceServerUrls(server: RTCIceServer | null) {
+  if (!server?.urls) return "";
+  return Array.isArray(server.urls) ? server.urls.join("\n") : server.urls;
+}
+
 export function App() {
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const artplayerContainerRef = useRef<HTMLDivElement | null>(null);
@@ -152,6 +181,16 @@ export function App() {
   const [responseInput, setResponseInput] = useState("");
   const [localTabPeer, setLocalTabPeer] = useState("No local tab");
   const [openedThroughRoomLink, setOpenedThroughRoomLink] = useState(false);
+  const [turnUrls, setTurnUrls] = useState(() => getIceServerUrls(getPrimaryIceServer(readStoredRtcConfig())));
+  const [turnUsername, setTurnUsername] = useState(() => {
+    const username = getPrimaryIceServer(readStoredRtcConfig())?.username;
+    return typeof username === "string" ? username : "";
+  });
+  const [turnCredential, setTurnCredential] = useState(() => {
+    const credential = getPrimaryIceServer(readStoredRtcConfig())?.credential;
+    return typeof credential === "string" ? credential : "";
+  });
+  const [forceRelay, setForceRelay] = useState(() => readStoredRtcConfig()?.iceTransportPolicy === "relay");
   const handledShareLinkRef = useRef(false);
   const localTabChannelRef = useRef<ReturnType<typeof createLocalTabChannel>>(null);
   const roleRef = useRef<"solo" | "host" | "guest">("solo");
@@ -372,6 +411,43 @@ export function App() {
     [log]
   );
 
+  const saveTurnConfig = useCallback(() => {
+    const urls = turnUrls
+      .split(/\r?\n|,/)
+      .map((url) => url.trim())
+      .filter(Boolean);
+
+    if (urls.length === 0) {
+      writeStoredRtcConfig(null);
+      setForceRelay(false);
+      log("warn", "ICE", "TURN relay config cleared. Public STUN/TURN fallback will be used.");
+      return;
+    }
+
+    const config: ShareRtcConfig = {
+      iceServers: [
+        {
+          urls,
+          username: turnUsername.trim() || undefined,
+          credential: turnCredential.trim() || undefined
+        }
+      ],
+      iceTransportPolicy: forceRelay ? "relay" : "all"
+    };
+
+    writeStoredRtcConfig(config);
+    log("ok", "ICE", `TURN relay config saved with ${urls.length} URL${urls.length === 1 ? "" : "s"}. Create a fresh invite link.`);
+  }, [forceRelay, log, turnCredential, turnUrls, turnUsername]);
+
+  const clearTurnConfig = useCallback(() => {
+    writeStoredRtcConfig(null);
+    setTurnUrls("");
+    setTurnUsername("");
+    setTurnCredential("");
+    setForceRelay(false);
+    log("warn", "ICE", "TURN relay config cleared. Public STUN/TURN fallback will be used.");
+  }, [log]);
+
   const createInviteLink = useCallback(async () => {
     const offer = await room.createHostOffer();
 
@@ -394,7 +470,8 @@ export function App() {
     const nextInviteLink = createShareUrl({
       type: "invite",
       offer,
-      media: shareableMedia
+      media: shareableMedia,
+      rtcConfig: readStoredRtcConfig()
     });
 
     setInviteLink(nextInviteLink);
@@ -499,6 +576,16 @@ export function App() {
 
     if (payload.type === "invite") {
       setOpenedThroughRoomLink(true);
+      if (payload.rtcConfig) {
+        writeStoredRtcConfig(payload.rtcConfig);
+        const server = getPrimaryIceServer(payload.rtcConfig);
+        setTurnUrls(getIceServerUrls(server));
+        setTurnUsername(typeof server?.username === "string" ? server.username : "");
+        setTurnCredential(typeof server?.credential === "string" ? server.credential : "");
+        setForceRelay(payload.rtcConfig.iceTransportPolicy === "relay");
+        log("ok", "ICE", "TURN relay config loaded from invite link.");
+      }
+
       if (payload.media?.origin === "remote-url") {
         mountRemoteMedia(payload.media.sourceUrl, "invite");
       }
@@ -1182,6 +1269,43 @@ export function App() {
               <p>
                 Send the invite link to a viewer. Once they open it, they will connect to your room automatically using PeerJS.
               </p>
+            </div>
+
+            <div className="relay-settings">
+              <span className="section-title">TURN Relay</span>
+              <label className="signal-box signal-box--compact">
+                URLs
+                <textarea
+                  value={turnUrls}
+                  onChange={(event) => setTurnUrls(event.target.value)}
+                  placeholder={"turn:relay.example.com:3478\nturns:relay.example.com:443?transport=tcp"}
+                  rows={3}
+                />
+              </label>
+              <div className="relay-settings__grid">
+                <label className="signal-box signal-box--compact">
+                  Username
+                  <input value={turnUsername} onChange={(event) => setTurnUsername(event.target.value)} />
+                </label>
+                <label className="signal-box signal-box--compact">
+                  Credential
+                  <input value={turnCredential} onChange={(event) => setTurnCredential(event.target.value)} type="password" />
+                </label>
+              </div>
+              <label className="relay-settings__toggle">
+                <input checked={forceRelay} onChange={(event) => setForceRelay(event.target.checked)} type="checkbox" />
+                Force TURN relay
+              </label>
+              <div className="relay-settings__actions">
+                <button type="button" onClick={saveTurnConfig}>
+                  <Settings size={14} />
+                  Save TURN
+                </button>
+                <button type="button" onClick={clearTurnConfig}>
+                  <RotateCcw size={14} />
+                  Clear
+                </button>
+              </div>
             </div>
 
             {/* Host send progress bar */}

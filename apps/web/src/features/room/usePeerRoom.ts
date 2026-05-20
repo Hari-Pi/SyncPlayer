@@ -63,11 +63,12 @@ function getCustomRtcConfig() {
 function createRtcConfig(relayOnly = false): ExtendedRTCConfiguration {
   const customConfig = getCustomRtcConfig();
   const customIceServers = customConfig?.iceServers ?? [];
+  const iceServers = customIceServers.length > 0 ? customIceServers : rtcConfig.iceServers;
 
   return {
     ...rtcConfig,
     ...customConfig,
-    iceServers: [...(rtcConfig.iceServers ?? []), ...customIceServers],
+    iceServers,
     iceTransportPolicy: relayOnly ? "relay" : customConfig?.iceTransportPolicy ?? rtcConfig.iceTransportPolicy,
     sdpSemantics: "unified-plan"
   };

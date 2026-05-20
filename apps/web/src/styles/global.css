@@ -524,6 +524,40 @@ textarea {
   color: var(--warn);
 }
 
+.relay-settings {
+  border: 1px solid rgba(55, 243, 255, 0.16);
+  display: grid;
+  gap: 0.45rem;
+  margin-bottom: 0.55rem;
+  padding: 0.58rem;
+}
+
+.relay-settings__grid,
+.relay-settings__actions {
+  display: grid;
+  gap: 0.45rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.relay-settings__toggle {
+  align-items: center;
+  color: var(--muted);
+  display: inline-flex;
+  font-size: 0.72rem;
+  gap: 0.45rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.relay-settings__toggle input {
+  accent-color: var(--accent-2);
+}
+
+.relay-settings__actions button {
+  min-height: 2rem;
+  padding: 0.4rem 0.55rem;
+}
+
 .signal-box {
   color: var(--muted);
   display: grid;
@@ -541,6 +575,7 @@ textarea {
 .signal-box textarea {
   font-size: 0.68rem;
   letter-spacing: 0;
+  min-height: 4.6rem;
   text-transform: none;
 }
 
@@ -653,6 +688,8 @@ textarea {
 
   .metrics-grid,
   .metrics-grid--wide,
+  .relay-settings__actions,
+  .relay-settings__grid,
   .share-flow {
     grid-template-columns: 1fr;
   }
