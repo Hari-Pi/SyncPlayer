@@ -23,7 +23,6 @@ import {
   Video
 } from "lucide-react";
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-// @ts-expect-error plyr types don't declare a default export properly
 import Plyr from "plyr";
 import "plyr/dist/plyr.css";
 import { createActivity, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
