@@ -439,7 +439,6 @@ textarea {
 .player-shell video {
   background: #000;
   height: 100%;
-  max-height: 54vh;
   object-fit: contain;
   width: 100%;
 }
