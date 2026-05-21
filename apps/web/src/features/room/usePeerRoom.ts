@@ -70,8 +70,7 @@ function createRtcConfig(relayOnly = false): ExtendedRTCConfiguration {
     ...rtcConfig,
     ...customConfig,
     iceServers,
-    iceTransportPolicy: relayOnly ? "relay" : customConfig?.iceTransportPolicy ?? rtcConfig.iceTransportPolicy,
-    sdpSemantics: "unified-plan"
+    iceTransportPolicy: relayOnly ? "relay" : customConfig?.iceTransportPolicy ?? rtcConfig.iceTransportPolicy
   };
 }
 
