@@ -262,10 +262,7 @@ export function App() {
         return;
       }
 
-      if (roleRef.current === "host") {
-        return;
-      }
-
+      // Removed strict roleRef.current === "host" blocker to allow bi-directional sync
       const reading = await readDrift(element.currentTime, remoteSnapshot.position, latencyMs);
       setDrift(reading);
       remoteApplyRef.current = true;
@@ -666,7 +663,7 @@ export function App() {
     log("info", "SHARE", "Response link detected. Paste it into the open host tab to finish connecting.");
   }, [log, mountRemoteMedia, room]);
 
-  const publishSnapshot = useCallback(() => {
+  const publishSnapshot = useCallback((isManual = false) => {
     const element = mediaRef.current;
 
     if (!element || !media || remoteApplyRef.current) {
@@ -684,8 +681,8 @@ export function App() {
 
     setSnapshot(nextSnapshot);
 
-    if (now - lastBroadcastRef.current > 250) {
-      if (room.role === "host") {
+    if (now - lastBroadcastRef.current > 250 || isManual) {
+      if (room.role === "host" || isManual) {
         room.sendPlaybackState(nextSnapshot);
       }
       localTabChannelRef.current?.post({
@@ -721,7 +718,7 @@ export function App() {
     }
 
     if (room.role === "host") {
-      publishSnapshot();
+      publishSnapshot(true);
       return;
     }
 
@@ -739,10 +736,10 @@ export function App() {
       } else {
         manualPauseTimesRef.current.push(now);
         log("info", "PLAYBACK", `Local pause registered (${manualPauseTimesRef.current.length}/3 in last 1m).`);
-        publishSnapshot();
+        publishSnapshot(true);
       }
     } else {
-      publishSnapshot();
+      publishSnapshot(true);
     }
   }, [room.role, publishSnapshot, log]);
 
@@ -1049,11 +1046,11 @@ export function App() {
       const video = art.video;
       mediaRef.current = video;
 
-      const onPlay = () => publishSnapshotRef.current();
+      const onPlay = () => publishSnapshotRef.current(true);
       const onPause = () => handlePauseRef.current();
-      const onSeeked = () => publishSnapshotRef.current();
-      const onRateChange = () => publishSnapshotRef.current();
-      const onTimeUpdate = () => publishSnapshotRef.current();
+      const onSeeked = () => publishSnapshotRef.current(true);
+      const onRateChange = () => publishSnapshotRef.current(true);
+      const onTimeUpdate = () => publishSnapshotRef.current(false);
       const onLoadedMetadata = () => handleLoadedMetadataRef.current();
 
       video.addEventListener("play", onPlay);

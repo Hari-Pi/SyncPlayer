@@ -203,7 +203,7 @@ const rtcConfig: ExtendedRTCConfiguration = {
     }
   ],
   iceCandidatePoolSize: 10,
-  sdpSemantics: "unified-plan"
+  iceTransportPolicy: "all"
 };
 
 // 64 KB chunks — optimal for WebRTC DataChannel throughput
