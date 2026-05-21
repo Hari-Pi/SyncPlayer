@@ -1033,12 +1033,14 @@ export function App() {
 
     art.on("fullscreen", (state) => {
       if (state) {
-        if (screen.orientation && screen.orientation.lock) {
-          screen.orientation.lock("landscape").catch(() => {});
+        if (screen.orientation && "lock" in screen.orientation) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (screen.orientation as any).lock("landscape").catch(() => {});
         }
       } else {
-        if (screen.orientation && screen.orientation.unlock) {
-          screen.orientation.unlock();
+        if (screen.orientation && "unlock" in screen.orientation) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (screen.orientation as any).unlock();
         }
       }
     });
