@@ -171,35 +171,16 @@ function setupConnectionDiagnostics(
 const rtcConfig: ExtendedRTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun3.l.google.com:19302" },
-    { urls: "stun:stun4.l.google.com:19302" },
-    { urls: "stun:stun.services.mozilla.com" },
     { urls: "stun:stun.cloudflare.com:3478" },
-    { urls: "stun:stun.sipgate.net:10000" },
-    { urls: "stun:stun.nextcloud.com:443" },
-    { urls: "stun:stun.t-online.de:3478" },
-    { urls: "stun:stun.schlund.de" },
-    { urls: "stun:openrelay.metered.ca:80" },
     {
-      urls: [
-        "turn:eu-0.turn.peerjs.com:3478",
-        "turn:us-0.turn.peerjs.com:3478"
-      ],
-      username: "peerjs",
-      credential: "peerjsp"
-    },
-    {
-      urls: [
-        "turn:openrelay.metered.ca:80",
-        "turn:openrelay.metered.ca:443",
-        "turn:openrelay.metered.ca:80?transport=tcp",
-        "turn:openrelay.metered.ca:443?transport=tcp",
-        "turns:openrelay.metered.ca:443?transport=tcp"
-      ],
+      urls: "turn:openrelay.metered.ca:443?transport=tcp",
       username: "openrelayproject",
       credential: "openrelayproject"
+    },
+    {
+      urls: "turn:eu-0.turn.peerjs.com:3478",
+      username: "peerjs",
+      credential: "peerjsp"
     }
   ],
   iceCandidatePoolSize: 10,
