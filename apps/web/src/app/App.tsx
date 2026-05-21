@@ -1031,6 +1031,18 @@ export function App() {
 
     artRef.current = art;
 
+    art.on("fullscreen", (state) => {
+      if (state) {
+        if (screen.orientation && screen.orientation.lock) {
+          screen.orientation.lock("landscape").catch(() => {});
+        }
+      } else {
+        if (screen.orientation && screen.orientation.unlock) {
+          screen.orientation.unlock();
+        }
+      }
+    });
+
     art.on("ready", () => {
       const video = art.video;
       mediaRef.current = video;
@@ -1224,7 +1236,6 @@ export function App() {
               <Metric label="LINK" value={room.status.toUpperCase()} tone={statusTone} />
               <Metric label="LATENCY" value={`${room.latencyMs}ms`} tone={room.latencyMs < 90 ? "ok" : "warn"} />
               <Metric label="PEER" value={room.remotePeer} />
-              <Metric label="LOCAL TAB" value={localTabPeer} tone={localTabPeer === "No local tab" ? "normal" : "ok"} />
             </div>
           </Panel>
 
