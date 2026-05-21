@@ -7,7 +7,9 @@ import {
   Clipboard,
   FileVideo,
   Gauge,
+  Hash,
   Link2,
+  LogIn,
   Pause,
   Radar,
   RadioTower,
@@ -136,6 +138,11 @@ function isLocalhost() {
   return ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
 }
 
+/** Display just the 4-digit code from a full SP-XXXX peer ID. */
+function formatRoomId(id: string) {
+  return id.startsWith("SP-") ? id.slice(3) : id;
+}
+
 function readStoredRtcConfig(): ShareRtcConfig | null {
   try {
     const stored = localStorage.getItem("syncplayer:rtcconfig");
@@ -193,6 +200,7 @@ export function App() {
   const [inviteLink, setInviteLink] = useState("");
   const [responseLink, setResponseLink] = useState("");
   const [responseInput, setResponseInput] = useState("");
+  const [joinCode, setJoinCode] = useState("");
   const [localTabPeer, setLocalTabPeer] = useState("No local tab");
   const [openedThroughRoomLink, setOpenedThroughRoomLink] = useState(false);
   const [turnUrls, setTurnUrls] = useState(() => getIceServerUrls(getPrimaryIceServer(readStoredRtcConfig())));
@@ -481,6 +489,16 @@ export function App() {
     setForceRelay(false);
     log("warn", "ICE", "TURN relay config cleared. Public STUN/TURN fallback will be used.");
   }, [log]);
+
+  const handleJoinByCode = useCallback(async () => {
+    const code = joinCode.replace(/\D/g, "").slice(0, 4);
+    if (code.length !== 4) {
+      log("warn", "JOIN", "Enter a 4-digit room code.");
+      return;
+    }
+    log("info", "JOIN", `Connecting to room ${code}...`);
+    await room.joinWithOffer(code);
+  }, [joinCode, room, log]);
 
   const createInviteLink = useCallback(async () => {
     const offer = await room.createHostOffer();
@@ -1141,7 +1159,7 @@ export function App() {
             <div className="status-band__text-group">
               <span className="status-band__title">Connecting to Room Host...</span>
               <span className="status-band__desc">
-                Establishing automated WebRTC link to Host (<strong>{room.localOffer}</strong>). Please wait while signaling completes...
+              Establishing automated WebRTC link to Host room <strong>{formatRoomId(room.localOffer)}</strong>. Please wait while signaling completes...
               </span>
             </div>
           </div>
@@ -1160,7 +1178,7 @@ export function App() {
             <div className="status-band__text-group">
               <span className="status-band__title">Connection Failed</span>
               <span className="status-band__desc">
-                Could not connect to Host (<strong>{room.localOffer}</strong>). Check the Activity Log below for details.
+                Could not connect to Host room <strong>{formatRoomId(room.localOffer)}</strong>. Check the Activity Log below for details.
               </span>
             </div>
           </div>
@@ -1333,49 +1351,73 @@ export function App() {
               </button>
             </div>
 
+            {/* ── Room Code — shown when hosting ── */}
+            {room.role === "host" && room.roomCode && (
+              <div className="room-code-display">
+                <span className="section-title">
+                  <Hash size={11} />
+                  Room Code
+                </span>
+                <div className="room-code-badge">
+                  <span className="room-code-digits">{room.roomCode}</span>
+                </div>
+                <button
+                  type="button"
+                  className="room-code-copy"
+                  onClick={() => {
+                    copyText(room.roomCode);
+                    log("ok", "SHARE", `Room code ${room.roomCode} copied to clipboard.`);
+                  }}
+                >
+                  <Clipboard size={13} />
+                  Copy Code
+                </button>
+                <p className="room-code-hint">Viewers can type this 4-digit code to join instantly.</p>
+              </div>
+            )}
+
+            {/* ── Join by Code — shown when not yet in a room ── */}
+            {room.role === "solo" && (room.status === "idle" || room.status === "disconnected") && (
+              <div className="join-by-code">
+                <span className="section-title">
+                  <LogIn size={11} />
+                  Join a Room
+                </span>
+                <div className="code-input-row">
+                  <input
+                    id="room-code-input"
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={4}
+                    value={joinCode}
+                    onChange={(e) => setJoinCode(e.target.value.replace(/\D/g, "").slice(0, 4))}
+                    onKeyDown={(e) => { if (e.key === "Enter") void handleJoinByCode(); }}
+                    placeholder="1234"
+                    className="room-code-input"
+                    aria-label="4-digit room code"
+                    autoComplete="off"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleJoinByCode()}
+                    disabled={joinCode.length !== 4}
+                    className={joinCode.length === 4 ? "primary-action" : ""}
+                  >
+                    <LogIn size={14} />
+                    Join
+                  </button>
+                </div>
+              </div>
+            )}
+
             <div className="helper-copy">
               <strong>How sharing works</strong>
               <p>
-                Send the invite link to a viewer. Once they open it, they will connect to your room automatically using PeerJS.
+                Start a room to get your 4-digit code. Share it with viewers — or use the invite link for one-click joining.
               </p>
             </div>
 
-            <div className="relay-settings">
-              <span className="section-title">TURN Relay</span>
-              <label className="signal-box signal-box--compact">
-                URLs
-                <textarea
-                  value={turnUrls}
-                  onChange={(event) => setTurnUrls(event.target.value)}
-                  placeholder={"turn:relay.example.com:3478\nturns:relay.example.com:443?transport=tcp"}
-                  rows={3}
-                />
-              </label>
-              <div className="relay-settings__grid">
-                <label className="signal-box signal-box--compact">
-                  Username
-                  <input value={turnUsername} onChange={(event) => setTurnUsername(event.target.value)} />
-                </label>
-                <label className="signal-box signal-box--compact">
-                  Credential
-                  <input value={turnCredential} onChange={(event) => setTurnCredential(event.target.value)} type="password" />
-                </label>
-              </div>
-              <label className="relay-settings__toggle">
-                <input checked={forceRelay} onChange={(event) => setForceRelay(event.target.checked)} type="checkbox" />
-                Force TURN relay
-              </label>
-              <div className="relay-settings__actions">
-                <button type="button" onClick={saveTurnConfig}>
-                  <Settings size={14} />
-                  Save TURN
-                </button>
-                <button type="button" onClick={clearTurnConfig}>
-                  <RotateCcw size={14} />
-                  Clear
-                </button>
-              </div>
-            </div>
+
 
             {/* Host send progress bar */}
             {room.fileSendProgress && (

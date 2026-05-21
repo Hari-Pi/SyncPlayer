@@ -173,7 +173,14 @@ const rtcConfig: ExtendedRTCConfiguration = {
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun3.l.google.com:19302" },
+    { urls: "stun:stun4.l.google.com:19302" },
     { urls: "stun:stun.services.mozilla.com" },
+    { urls: "stun:stun.cloudflare.com:3478" },
+    { urls: "stun:stun.sipgate.net:10000" },
+    { urls: "stun:stun.nextcloud.com:443" },
+    { urls: "stun:stun.t-online.de:3478" },
+    { urls: "stun:stun.schlund.de" },
     { urls: "stun:openrelay.metered.ca:80" },
     {
       urls: [
@@ -232,6 +239,11 @@ function waitForDrain(conn: DataConnection): Promise<void> {
   });
 }
 
+/** Generate a 4-digit numeric room code (1000–9999). */
+function genRoomCode(): string {
+  return String(Math.floor(1000 + Math.random() * 9000));
+}
+
 export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMount }: PeerRoomOptions) {
   const [role, setRole] = useState<RoomRole>("solo");
   const [status, setStatus] = useState<LinkStatus>("idle");
@@ -245,7 +257,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const [fileSendProgress, setFileSendProgress] = useState<FileSendProgress | null>(null);
   const [fileReceiveProgress, setFileReceiveProgress] = useState<FileReceiveProgress | null>(null);
 
-  const peerId = useMemo(() => `SP-${crypto.randomUUID().slice(0, 8).toUpperCase()}`, []);
+  const peerId = useMemo(() => `SP-${genRoomCode()}`, []);
+
 
   // Stable callback refs — prevent stale closures in DataChannel listeners
   const onPlaybackStateRef = useRef(onPlaybackState);
@@ -666,7 +679,9 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   }, []);
 
   const joinWithOffer = useCallback(
-    async (hostId: string) => {
+    async (rawId: string) => {
+      // Normalise: bare 4-digit code → full Peer ID (SP-XXXX)
+      const hostId = /^\d{4}$/.test(rawId.trim()) ? `SP-${rawId.trim()}` : rawId.trim();
       const attemptId = joinAttemptRef.current + 1;
       closeRoom();
       joinAttemptRef.current = attemptId;
@@ -787,6 +802,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     role,
     status,
     peerId,
+    roomCode: peerId.replace(/^SP-/, ""),
     remotePeer,
     localOffer,
     localAnswer,
