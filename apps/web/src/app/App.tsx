@@ -23,7 +23,9 @@ import {
   Video
 } from "lucide-react";
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Artplayer from "artplayer";
+// @ts-expect-error plyr types don't declare a default export properly
+import Plyr from "plyr";
+import "plyr/dist/plyr.css";
 import { createActivity, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
 import { usePeerRoom } from "@/features/room/usePeerRoom";
 import { createMediaHint, loadSyncCore, readDrift, quantisePositionSync, type DriftReading } from "@/lib/wasm/syncCore";
@@ -186,8 +188,8 @@ function createRemoteMedia(url: string): LoadedMedia {
 
 export function App() {
   const mediaRef = useRef<HTMLMediaElement | null>(null);
-  const artplayerContainerRef = useRef<HTMLDivElement | null>(null);
-  const artRef = useRef<Artplayer | null>(null);
+  const plyrContainerRef = useRef<HTMLVideoElement | null>(null);
+  const plyrRef = useRef<Plyr | null>(null);
   const remoteApplyRef = useRef(false);
   const lastBroadcastRef = useRef(0);
   const [clock, setClock] = useState(formatClock());
@@ -953,100 +955,34 @@ export function App() {
     };
   }, [log, media?.format, media?.id, media?.sourceUrl, media?.kind]);
 
-  // Video media loader via ArtPlayer
+  // Video media loader via Plyr
   useEffect(() => {
-    const container = artplayerContainerRef.current;
-    if (!container || !media || media.kind !== "video") {
+    const video = plyrContainerRef.current;
+    if (!video || !media || media.kind !== "video") {
       return;
     }
 
-    if (artRef.current) {
-      artRef.current.destroy(true);
-      artRef.current = null;
+    if (plyrRef.current) {
+      plyrRef.current.destroy();
+      plyrRef.current = null;
     }
 
-    // ArtPlayer throws if `type` is explicitly `undefined`; only include it for
-    // custom-loaded stream formats (hls → m3u8, dash → mpd).
     const streamType =
       media.format === "hls" ? "m3u8" : media.format === "dash" ? "mpd" : null;
 
-    const art = new Artplayer({
-      container,
-      url: media.sourceUrl,
-      ...(streamType ? { type: streamType } : {}),
-      theme: "#37f3ff",
-      volume: 0.7,
-      muted: false,
-      autoplay: false,
-      playbackRate: true,
-      aspectRatio: true,
-      setting: true,
-      hotkey: true,
-      pip: true,
-      fullscreen: true,
-      fullscreenWeb: true,
-      miniProgressBar: true,
-      playsInline: true,
-      airplay: true,
-      customType: {
-        m3u8: function (video, url, artInstance) {
-          import("hls.js").then(({ default: Hls }) => {
-            if (!Hls.isSupported()) {
-              if (video.canPlayType("application/vnd.apple.mpegurl")) {
-                video.src = url;
-              } else {
-                log("error", "HLS", "HLS is not supported in this browser.");
-              }
-              return;
-            }
-            const hls = new Hls({
-              enableWorker: true,
-              lowLatencyMode: true
-            });
-            hls.loadSource(url);
-            hls.attachMedia(video);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => {
-              log("ok", "HLS", "HLS stream manifest attached to ArtPlayer.");
-            });
-            hls.on(Hls.Events.ERROR, (_, data) => {
-              log(data.fatal ? "error" : "warn", "HLS", `${data.type}: ${data.details}`);
-            });
-            artInstance.on("destroy", () => hls.destroy());
-          });
-        },
-        mpd: function (video, url, artInstance) {
-          import("dashjs").then((dashjs) => {
-            if (!dashjs.supportsMediaSource()) {
-              log("error", "DASH", "MPEG-DASH is not supported in this browser.");
-              return;
-            }
-            const player = dashjs.MediaPlayer().create();
-            player.initialize(video, url, false);
-            log("ok", "DASH", "MPEG-DASH stream attached to ArtPlayer.");
-            artInstance.on("destroy", () => player.reset());
-          });
-        }
-      }
-    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let hlsInstance: any = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let dashInstance: any = null;
 
-    artRef.current = art;
-
-    art.on("fullscreen", (state) => {
-      if (state) {
-        if (screen.orientation && "lock" in screen.orientation) {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (screen.orientation as any).lock("landscape").catch(() => {});
-        }
-      } else {
-        if (screen.orientation && "unlock" in screen.orientation) {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (screen.orientation as any).unlock();
-        }
-      }
-    });
-
-    art.on("ready", () => {
-      const video = art.video;
+    const initPlyr = () => {
+      const player = new Plyr(video, {
+        controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'captions', 'settings', 'pip', 'airplay', 'fullscreen'],
+        settings: ['quality', 'speed', 'loop'],
+        keyboard: { focused: true, global: true },
+        tooltips: { controls: true, seek: true },
+      });
+      plyrRef.current = player;
       mediaRef.current = video;
 
       const onPlay = () => publishSnapshotRef.current();
@@ -1066,21 +1002,60 @@ export function App() {
       if (video.duration) {
         onLoadedMetadata();
       }
+    };
 
-      art.on("destroy", () => {
-        video.removeEventListener("play", onPlay);
-        video.removeEventListener("pause", onPause);
-        video.removeEventListener("seeked", onSeeked);
-        video.removeEventListener("ratechange", onRateChange);
-        video.removeEventListener("timeupdate", onTimeUpdate);
-        video.removeEventListener("loadedmetadata", onLoadedMetadata);
+    if (streamType === "m3u8") {
+      import("hls.js").then(({ default: Hls }) => {
+        if (!Hls.isSupported()) {
+          if (video.canPlayType("application/vnd.apple.mpegurl")) {
+            video.src = media.sourceUrl;
+            initPlyr();
+          } else {
+            log("error", "HLS", "HLS is not supported in this browser.");
+          }
+          return;
+        }
+        const hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: true
+        });
+        hlsInstance = hls;
+        hls.loadSource(media.sourceUrl);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          log("ok", "HLS", "HLS stream manifest attached to Plyr.");
+          initPlyr();
+        });
+        hls.on(Hls.Events.ERROR, (_, data) => {
+          log(data.fatal ? "error" : "warn", "HLS", `${data.type}: ${data.details}`);
+        });
       });
-    });
+    } else if (streamType === "mpd") {
+      import("dashjs").then((dashjs) => {
+        if (!dashjs.supportsMediaSource()) {
+          log("error", "DASH", "MPEG-DASH is not supported in this browser.");
+          return;
+        }
+        dashInstance = dashjs.MediaPlayer().create();
+        dashInstance.initialize(video, media.sourceUrl, false);
+        log("ok", "DASH", "MPEG-DASH stream attached to Plyr.");
+        initPlyr();
+      });
+    } else {
+      video.src = media.sourceUrl;
+      initPlyr();
+    }
 
     return () => {
-      if (artRef.current) {
-        artRef.current.destroy(true);
-        artRef.current = null;
+      if (plyrRef.current) {
+        plyrRef.current.destroy();
+        plyrRef.current = null;
+      }
+      if (hlsInstance) {
+        hlsInstance.destroy();
+      }
+      if (dashInstance) {
+        dashInstance.reset();
       }
       mediaRef.current = null;
     };
@@ -1334,9 +1309,11 @@ export function App() {
                     />
                   </div>
                 ) : (
-                  <div
-                    ref={artplayerContainerRef}
-                    className="artplayer-container"
+                  <video
+                    ref={plyrContainerRef}
+                    className="plyr-react"
+                    crossOrigin="anonymous"
+                    playsInline
                     style={{ width: "100%", height: "100%", minHeight: "360px" }}
                   />
                 )

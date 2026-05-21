@@ -12,11 +12,11 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",
-    "artplayer": "^5.4.0",
     "dashjs": "^5.1.1",
     "hls.js": "^1.6.16",
     "lucide-react": "^0.556.0",
     "peerjs": "^1.5.5",
+    "plyr": "^3.8.4",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
     "typescript": "^5.9.3",

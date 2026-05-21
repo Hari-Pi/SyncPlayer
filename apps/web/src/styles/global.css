@@ -15,6 +15,15 @@
   --text: #defbff;
   --muted: #729aa3;
   --shadow: 0 0 22px rgba(55, 243, 255, 0.13);
+
+  /* Plyr Theming */
+  --plyr-color-main: var(--accent);
+  --plyr-video-background: transparent;
+  --plyr-menu-background: var(--panel-strong);
+  --plyr-menu-color: var(--text);
+  --plyr-tooltip-background: var(--panel-strong);
+  --plyr-tooltip-color: var(--text);
+  --plyr-font-family: inherit;
 }
 
 * {
