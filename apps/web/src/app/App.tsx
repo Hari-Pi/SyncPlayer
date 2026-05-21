@@ -694,7 +694,7 @@ export function App() {
   }, [media, room]);
 
   useEffect(() => {
-    const timer = window.setInterval(publishSnapshot, 1500);
+    const timer = window.setInterval(() => publishSnapshot(false), 1500);
     return () => window.clearInterval(timer);
   }, [publishSnapshot]);
 
@@ -1152,7 +1152,7 @@ export function App() {
           </div>
           <div className="status-band__actions">
             {room.role === "host" && (
-              <button type="button" className="status-band__btn" onClick={publishSnapshot}>
+              <button type="button" className="status-band__btn" onClick={() => publishSnapshot(true)}>
                 Force Sync State
               </button>
             )}
@@ -1323,11 +1323,11 @@ export function App() {
                       ref={bindMediaElement}
                       controls
                       onLoadedMetadata={handleLoadedMetadata}
-                      onPlay={publishSnapshot}
+                      onPlay={() => publishSnapshot(true)}
                       onPause={handlePause}
-                      onSeeked={publishSnapshot}
-                      onRateChange={publishSnapshot}
-                      onTimeUpdate={publishSnapshot}
+                      onSeeked={() => publishSnapshot(true)}
+                      onRateChange={() => publishSnapshot(true)}
+                      onTimeUpdate={() => publishSnapshot(false)}
                     />
                   </div>
                 ) : (
@@ -1471,7 +1471,7 @@ export function App() {
               )}
             </div>
 
-            <button type="button" onClick={publishSnapshot} style={{ marginTop: "1.2rem" }}>
+            <button type="button" onClick={() => publishSnapshot(true)} style={{ marginTop: "1.2rem" }}>
               <CircleDot size={15} />
               Send Current Playback State
             </button>
