@@ -69,3 +69,31 @@ export function mediaFormatLabel(format: MediaFormat) {
 
   return "UNKNOWN";
 }
+
+/**
+ * Check if a MIME type / filename is compatible with MediaSource Extensions.
+ * MSE supports MP4, WebM, and common audio codecs. MKV, AVI, MOV, etc.
+ * cannot be progressively decoded and must use the full-blob path.
+ */
+export function isMseCompatible(typeOrName: string): boolean {
+  const v = typeOrName.toLowerCase();
+
+  // MIME types the browser MSE typically accepts
+  if (
+    v.startsWith("video/mp4") ||
+    v.startsWith("video/webm") ||
+    v.startsWith("audio/mp4") ||
+    v.startsWith("audio/webm") ||
+    v.startsWith("audio/mpeg") ||
+    v.startsWith("audio/aac")
+  ) {
+    return true;
+  }
+
+  // Fallback: check file extension
+  if (/\.(mp4|m4v|webm|mp3|m4a|aac)(\?|#|$)/.test(v)) {
+    return true;
+  }
+
+  return false;
+}
