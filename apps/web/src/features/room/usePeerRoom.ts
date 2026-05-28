@@ -165,6 +165,13 @@ function setupConnectionDiagnostics(
     const level = pc.connectionState === "failed" ? "error" : pc.connectionState === "connected" ? "ok" : "info";
     onEvent(level, "ICE", `${peerLabel}: peer connection state ${pc.connectionState}.`);
   });
+
+  pc.addEventListener("iceconnectionstatechange", () => {
+    if (pc.iceConnectionState === "disconnected") {
+      onEvent("warn", "ICE", `${peerLabel}: ICE disconnected. Attempting ICE restart...`);
+      pc.restartIce();
+    }
+  });
 }
 
 const rtcConfig: ExtendedRTCConfiguration = {
@@ -172,7 +179,16 @@ const rtcConfig: ExtendedRTCConfiguration = {
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun.cloudflare.com:3478" },
     {
-      urls: "turn:openrelay.metered.ca:443?transport=tcp",
+      urls: [
+        "turn:openrelay.metered.ca:80",
+        "turn:openrelay.metered.ca:443",
+        "turn:openrelay.metered.ca:443?transport=tcp"
+      ],
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    },
+    {
+      urls: "turns:openrelay.metered.ca:443",
       username: "openrelayproject",
       credential: "openrelayproject"
     },

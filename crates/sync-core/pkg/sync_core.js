@@ -1,6 +1,28 @@
 /* @ts-self-types="./sync_core.d.ts" */
 
 /**
+ * Per-chunk checksum: FNV-1a of (chunk_index_bytes ++ chunk_data).
+ * Lets the receiver verify each chunk independently before appending to MSE/blob.
+ * @param {number} index
+ * @param {Uint8Array} data
+ * @returns {string}
+ */
+export function chunk_checksum(index, data) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.chunk_checksum(index, ptr0, len0);
+        deferred2_0 = ret[0];
+        deferred2_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
  * @param {number} local_position_secs
  * @param {number} host_position_secs
  * @param {number} latency_ms
@@ -31,6 +53,41 @@ export function drift_ms(local_position_secs, host_position_secs, latency_ms) {
 }
 
 /**
+ * FNV-1a 64-bit hash of a byte slice. Fast, non-cryptographic, zero-alloc.
+ * Used to verify file chunk integrity and final file checksum over P2P.
+ * @param {Uint8Array} data
+ * @returns {string}
+ */
+export function fnv1a_hash(data) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.fnv1a_hash(ptr0, len0);
+        deferred2_0 = ret[0];
+        deferred2_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * Exponentially weighted moving average of RTT latency samples.
+ * Alpha = 0.25 (new sample weight). Smooths jitter from bursty network conditions.
+ * Pass a JS Float64Array (as &[f64]) of recent RTT samples (newest last).
+ * @param {Float64Array} samples
+ * @returns {number}
+ */
+export function interpolate_latency(samples) {
+    const ptr0 = passArrayF64ToWasm0(samples, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.interpolate_latency(ptr0, len0);
+    return ret;
+}
+
+/**
  * @param {number} size_bytes
  * @param {number} duration_secs
  * @param {number} modified_ms
@@ -47,6 +104,19 @@ export function media_identity_hint(size_bytes, duration_secs, modified_ms) {
     } finally {
         wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
     }
+}
+
+/**
+ * Snap a playback position to the nearest frame boundary for the given frame rate.
+ * Prevents sub-frame drift oscillation when the host and guest clocks fight over
+ * fractions of a millisecond.
+ * @param {number} position_secs
+ * @param {number} fps
+ * @returns {number}
+ */
+export function quantise_position(position_secs, fps) {
+    const ret = wasm.quantise_position(position_secs, fps);
+    return ret;
 }
 
 /**
@@ -78,6 +148,14 @@ function __wbg_get_imports() {
     };
 }
 
+let cachedFloat64ArrayMemory0 = null;
+function getFloat64ArrayMemory0() {
+    if (cachedFloat64ArrayMemory0 === null || cachedFloat64ArrayMemory0.byteLength === 0) {
+        cachedFloat64ArrayMemory0 = new Float64Array(wasm.memory.buffer);
+    }
+    return cachedFloat64ArrayMemory0;
+}
+
 function getStringFromWasm0(ptr, len) {
     return decodeText(ptr >>> 0, len);
 }
@@ -88,6 +166,20 @@ function getUint8ArrayMemory0() {
         cachedUint8ArrayMemory0 = new Uint8Array(wasm.memory.buffer);
     }
     return cachedUint8ArrayMemory0;
+}
+
+function passArray8ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 1, 1) >>> 0;
+    getUint8ArrayMemory0().set(arg, ptr / 1);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
+}
+
+function passArrayF64ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 8, 8) >>> 0;
+    getFloat64ArrayMemory0().set(arg, ptr / 8);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
 }
 
 let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
@@ -104,11 +196,14 @@ function decodeText(ptr, len) {
     return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
 }
 
+let WASM_VECTOR_LEN = 0;
+
 let wasmModule, wasmInstance, wasm;
 function __wbg_finalize_init(instance, module) {
     wasmInstance = instance;
     wasm = instance.exports;
     wasmModule = module;
+    cachedFloat64ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
     wasm.__wbindgen_start();
     return wasm;
