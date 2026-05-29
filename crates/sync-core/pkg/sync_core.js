@@ -1,5 +1,46 @@
 /* @ts-self-types="./sync_core.d.ts" */
 
+export class RemuxSession {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        RemuxSessionFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_remuxsession_free(ptr, 0);
+    }
+    /**
+     * @returns {string}
+     */
+    get_tracks() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.remuxsession_get_tracks(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @param {any} js_reader
+     */
+    constructor(js_reader) {
+        const ret = wasm.remuxsession_new(js_reader);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0];
+        RemuxSessionFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+}
+if (Symbol.dispose) RemuxSession.prototype[Symbol.dispose] = RemuxSession.prototype.free;
+
 /**
  * Per-chunk checksum: FNV-1a of (chunk_index_bytes ++ chunk_data).
  * Lets the receiver verify each chunk independently before appending to MSE/blob.
@@ -132,6 +173,29 @@ export function suggested_rate(local_position_secs, host_position_secs, latency_
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
+        __wbg___wbindgen_throw_1506f2235d1bdba0: function(arg0, arg1) {
+            throw new Error(getStringFromWasm0(arg0, arg1));
+        },
+        __wbg_length_4a591ecaa01354d9: function(arg0) {
+            const ret = arg0.length;
+            return ret;
+        },
+        __wbg_prototypesetcall_3249fc62a0fafa30: function(arg0, arg1, arg2) {
+            Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), arg2);
+        },
+        __wbg_read_sync_894cd3351c19129f: function(arg0, arg1, arg2) {
+            const ret = arg0.read_sync(arg1, arg2);
+            return ret;
+        },
+        __wbg_size_7c90db7ca7d24f36: function(arg0) {
+            const ret = arg0.size();
+            return ret;
+        },
+        __wbindgen_cast_0000000000000001: function(arg0, arg1) {
+            // Cast intrinsic for `Ref(String) -> Externref`.
+            const ret = getStringFromWasm0(arg0, arg1);
+            return ret;
+        },
         __wbindgen_init_externref_table: function() {
             const table = wasm.__wbindgen_externrefs;
             const offset = table.grow(4);
@@ -146,6 +210,15 @@ function __wbg_get_imports() {
         __proto__: null,
         "./sync_core_bg.js": import0,
     };
+}
+
+const RemuxSessionFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_remuxsession_free(ptr, 1));
+
+function getArrayU8FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
 }
 
 let cachedFloat64ArrayMemory0 = null;
@@ -180,6 +253,12 @@ function passArrayF64ToWasm0(arg, malloc) {
     getFloat64ArrayMemory0().set(arg, ptr / 8);
     WASM_VECTOR_LEN = arg.length;
     return ptr;
+}
+
+function takeFromExternrefTable0(idx) {
+    const value = wasm.__wbindgen_externrefs.get(idx);
+    wasm.__externref_table_dealloc(idx);
+    return value;
 }
 
 let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });

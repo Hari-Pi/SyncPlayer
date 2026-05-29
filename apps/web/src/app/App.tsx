@@ -31,6 +31,7 @@ import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
 import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia } from "@/lib/media/mediaTypes";
 import { createLocalTabChannel } from "@/lib/sync/localTabSync";
 import type { PlaybackSnapshot, FileMeta, RemoteMediaMount } from "@/lib/webrtc/messages";
+import { CHUNK_SIZE } from "@/lib/webrtc/messages";
 import type { FileStreamHandlers } from "@/features/room/usePeerRoom";
 
 const emptyDrift: DriftReading = {
@@ -293,113 +294,81 @@ export function App() {
   // ── Guest file stream receiver ─────────────────────────────────────────────
   const handleFileStream = useCallback((meta: FileMeta): FileStreamHandlers => {
     setGuestStreamUrl((previousUrl) => {
-      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      if (previousUrl) {
+        URL.revokeObjectURL(previousUrl);
+      }
       return null;
     });
-    guestMseRef.current = null;
-    guestBlobChunksRef.current = [];
     setGuestStreamMeta(meta);
-    log("info", "FILE", `Receiving "${meta.fileName}" (${(meta.fileSize / 1024 / 1024).toFixed(1)} MB) — ${meta.isBlob ? "full blob" : "MSE stream"} mode`);
+    log("info", "FILE", `Receiving "${meta.fileName}" (${(meta.fileSize / 1024 / 1024).toFixed(1)} MB) to local disk...`);
 
-    // Set up the media state on the guest side so mediaId matches the host.
-    // For blob mode, defer the full mount until the blob is ready — setting
-    // sourceUrl to "" would cause ArtPlayer to fail loading an empty URL.
     const kind = inferMediaKind(meta.mimeType || meta.fileName);
-    const format = inferMediaFormat(meta.mimeType || meta.fileName);
+    const format = meta.format;
 
-    if (!meta.isBlob) {
-      // MSE progressive path — start playing immediately
-      const ms = new MediaSource();
-      const url = URL.createObjectURL(ms);
-      const pendingChunks: ArrayBuffer[] = [];
-      let appendChunk = (chunk: ArrayBuffer) => {
-        pendingChunks.push(chunk);
-      };
+    let opfsFileHandle: FileSystemFileHandle | null = null;
+    let writableStream: FileSystemWritableFileStream | null = null;
+    let writeQueue: Promise<void> = Promise.resolve();
+    let aborted = false;
 
-      ms.addEventListener("sourceopen", () => {
-        let sb: SourceBuffer;
-        try { sb = ms.addSourceBuffer(meta.mimeType); }
-        catch { try { sb = ms.addSourceBuffer("video/mp4"); } catch { return; } }
+    // Initialize OPFS
+    writeQueue = writeQueue.then(async () => {
+      try {
+        const root = await navigator.storage.getDirectory();
+        // Create a unique temporary file
+        opfsFileHandle = await root.getFileHandle(`syncplayer-transfer-${meta.mediaId}`, { create: true });
+        writableStream = await opfsFileHandle.createWritable();
+      } catch (err) {
+        log("error", "FILE", `Failed to initialize OPFS storage: ${err instanceof Error ? err.message : String(err)}`);
+        aborted = true;
+      }
+    });
 
-        const state = { ms, sb, queue: [] as ArrayBuffer[], updating: false };
-        guestMseRef.current = state;
-
-        const flush = () => {
-          if (state.updating || state.sb.updating || state.queue.length === 0) return;
-          const chunk = state.queue.shift()!;
-          state.updating = true;
-          try { state.sb.appendBuffer(chunk); } catch { state.updating = false; }
-        };
-
-        sb.addEventListener("updateend", () => { state.updating = false; flush(); });
-        appendChunk = (chunk) => {
-          state.queue.push(chunk);
-          flush();
-        };
-        pendingChunks.splice(0).forEach(appendChunk);
-      }, { once: true });
-
-      setGuestStreamUrl(url);
-      setMedia({
-        id: meta.mediaId,
-        title: meta.fileName,
-        sourceUrl: url,
-        kind,
-        format,
-        origin: "remote-url",
-        sizeBytes: meta.fileSize
-      });
-
-      return {
-        onChunk: (_index, _total, data) => {
-          const chunk = new ArrayBuffer(data.byteLength);
-          new Uint8Array(chunk).set(data);
-          appendChunk(chunk);
-        },
-        onEnd: () => {
-          const tryEnd = () => {
-            const state = guestMseRef.current;
-            if (!state) {
-              setTimeout(tryEnd, 150);
-              return;
-            }
-            if (state.queue.length === 0 && !state.sb.updating) {
-              try { state.ms.endOfStream(); } catch { /* ignore */ }
-              setGuestStreamMeta(null);
-              guestMseRef.current = null;
-            } else { setTimeout(tryEnd, 150); }
-          };
-          tryEnd();
-        }
-      };
-    } else {
-      // Full blob path — accumulate then mount (MKV etc.)
-      guestBlobChunksRef.current = [];
-      return {
-        onChunk: (index, _total, data) => {
-          const chunk = new ArrayBuffer(data.byteLength);
-          new Uint8Array(chunk).set(data);
-          guestBlobChunksRef.current[index] = chunk;
-        },
-        onEnd: () => {
-          const blob = new Blob(guestBlobChunksRef.current, { type: meta.mimeType || "video/x-matroska" });
-          const url = URL.createObjectURL(blob);
-          guestBlobChunksRef.current = [];
-          setGuestStreamUrl(url);
-          setMedia({
-            id: meta.mediaId,
-            title: meta.fileName,
-            sourceUrl: url,
-            kind,
-            format,
-            origin: "remote-url",
-            sizeBytes: meta.fileSize
-          });
-          setGuestStreamMeta(null);
-          log("ok", "FILE", `"${meta.fileName}" received and mounted for playback.`);
-        }
-      };
-    }
+    return {
+      onChunk: (index, _total, data) => {
+        if (aborted) return;
+        writeQueue = writeQueue.then(async () => {
+          if (!writableStream || aborted) return;
+          try {
+            await writableStream.write({
+              type: "write",
+              position: index * CHUNK_SIZE,
+              data: data.buffer as ArrayBuffer
+            });
+          } catch (err) {
+            log("error", "FILE", `Failed to write chunk ${index}: ${err instanceof Error ? err.message : String(err)}`);
+            aborted = true;
+          }
+        });
+      },
+      onEnd: () => {
+        if (aborted) return;
+        writeQueue = writeQueue.then(async () => {
+          if (!writableStream || !opfsFileHandle) return;
+          try {
+            await writableStream.close();
+            const file = await opfsFileHandle.getFile();
+            // Since `File` from OPFS is read on-demand, we can safely create an object URL!
+            const url = URL.createObjectURL(file);
+            
+            setGuestStreamUrl(url);
+            setMedia({
+              id: meta.mediaId,
+              title: meta.fileName,
+              sourceUrl: url,
+              kind,
+              format,
+              origin: "local-file", // Treat it exactly like a local file!
+              sizeBytes: meta.fileSize,
+              
+            });
+            setGuestStreamMeta(null);
+            log("ok", "FILE", `"${meta.fileName}" completely downloaded and mounted for playback.`);
+          } catch (err) {
+            log("error", "FILE", `Failed to finalize file transfer: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        });
+      }
+    };
   }, [log]);
 
   const mountRemoteMedia = useCallback(
@@ -811,7 +780,7 @@ export function App() {
     const currentMedia = mediaStateRef.current;
     if (newPeers.length > 0 && room.role === "host" && hostFileRef.current && currentMedia?.origin === "local-file") {
       log("info", "FILE", `New peer(s) connected: ${newPeers.join(", ")}. Streaming local file to them...`);
-      void room.sendFile(hostFileRef.current, currentMedia.id);
+      void room.sendFile(hostFileRef.current, currentMedia.id, newPeers);
       return;
     }
 
@@ -1313,22 +1282,22 @@ export function App() {
           </div>
 
           <Panel title="Playback Surface" icon={<Video size={15} />} className="player-panel">
-            <div className="player-shell">
-              {/* Guest receive progress bar */}
-              {guestStreamMeta && (
-                <div className="stream-progress-wrap">
-                  <div className="stream-progress-label">
-                    <span>{guestStreamMeta.isBlob ? "Receiving file" : "Streaming"}: <strong>{guestStreamMeta.fileName}</strong></span>
-                    <span>{room.fileReceiveProgress ? `${Math.round((room.fileReceiveProgress.chunksReceived / room.fileReceiveProgress.total) * 100)}%` : ""}</span>
-                  </div>
-                  <div className="stream-progress-bar">
-                    <div
-                      className="stream-progress-bar__fill"
-                      style={{ width: room.fileReceiveProgress ? `${(room.fileReceiveProgress.chunksReceived / room.fileReceiveProgress.total) * 100}%` : "0%" }}
-                    />
-                  </div>
+            {/* Guest receive progress bar */}
+            {guestStreamMeta && (
+              <div className="stream-progress-wrap" style={{ marginBottom: "1rem" }}>
+                <div className="stream-progress-label">
+                  <span>{guestStreamMeta.isBlob ? "Receiving file" : "Streaming"}: <strong>{guestStreamMeta.fileName}</strong></span>
+                  <span>{room.fileReceiveProgress ? `${Math.round((room.fileReceiveProgress.chunksReceived / room.fileReceiveProgress.total) * 100)}% of ${formatBytes(room.fileReceiveProgress.totalBytes)}` : ""}</span>
                 </div>
-              )}
+                <div className="stream-progress-bar">
+                  <div
+                    className="stream-progress-bar__fill"
+                    style={{ width: room.fileReceiveProgress ? `${(room.fileReceiveProgress.chunksReceived / room.fileReceiveProgress.total) * 100}%` : "0%" }}
+                  />
+                </div>
+              </div>
+            )}
+            <div className="player-shell">
               {media ? (
                 media.kind === "audio" ? (
                   <div className="audio-stage">
@@ -1449,7 +1418,7 @@ export function App() {
               <div className="stream-progress-wrap">
                 <div className="stream-progress-label">
                   <span>Streaming to peers: <strong>{room.fileSendProgress.fileName}</strong></span>
-                  <span>{Math.round((room.fileSendProgress.chunksSent / room.fileSendProgress.total) * 100)}%</span>
+                  <span>{Math.round((room.fileSendProgress.chunksSent / room.fileSendProgress.total) * 100)}% of {formatBytes(room.fileSendProgress.totalBytes)}</span>
                 </div>
                 <div className="stream-progress-bar">
                   <div

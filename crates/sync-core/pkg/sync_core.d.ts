@@ -1,6 +1,13 @@
 /* tslint:disable */
 /* eslint-disable */
 
+export class RemuxSession {
+    free(): void;
+    [Symbol.dispose](): void;
+    get_tracks(): string;
+    constructor(js_reader: any);
+}
+
 /**
  * Per-chunk checksum: FNV-1a of (chunk_index_bytes ++ chunk_data).
  * Lets the receiver verify each chunk independently before appending to MSE/blob.
@@ -47,9 +54,13 @@ export interface InitOutput {
     readonly media_identity_hint: (a: number, b: number, c: number) => [number, number];
     readonly quantise_position: (a: number, b: number) => number;
     readonly suggested_rate: (a: number, b: number, c: number) => number;
+    readonly __wbg_remuxsession_free: (a: number, b: number) => void;
+    readonly remuxsession_get_tracks: (a: number) => [number, number];
+    readonly remuxsession_new: (a: any) => [number, number, number];
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
+    readonly __externref_table_dealloc: (a: number) => void;
     readonly __wbindgen_start: () => void;
 }
 

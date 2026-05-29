@@ -1,5 +1,7 @@
 use wasm_bindgen::prelude::*;
 
+pub mod remux;
+
 // ─── Playback Sync ─────────────────────────────────────────────────────────────
 
 #[wasm_bindgen]

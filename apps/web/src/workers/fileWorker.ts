@@ -4,7 +4,6 @@
  * The main thread posts a { type: "start", file, mediaId, chunkSize } message.
  * This worker reads the file in chunks, computes per-chunk FNV-1a checksums,
  * and posts each chunk back so the main thread can forward it over the P2P data channel.
- * Running off the main thread keeps the UI fully responsive during large transfers.
  */
 
 // FNV-1a 64-bit — pure JS, no imports needed in the worker context
@@ -38,89 +37,72 @@ function chunkChecksum(index: number, data: Uint8Array): string {
 }
 
 type WorkerInMessage =
-  | { type: "start"; file: File; mediaId: string; chunkSize: number }
+  | { type: "start"; file: File; mediaId: string; chunkSize: number; startChunkIndex: number; endChunkIndex: number; totalChunks: number }
   | { type: "cancel" };
 
 export type WorkerOutMessage =
   | { type: "ready" }
   | { type: "chunk"; mediaId: string; index: number; total: number; data: Uint8Array; checksum: string }
-  | { type: "end"; mediaId: string; checksum: string }
-  | { type: "error"; message: string }
-  | { type: "progress"; index: number; total: number };
+  | { type: "worker_done"; mediaId: string; workerStartChunk: number }
+  | { type: "error"; mediaId: string; error: string };
 
-let cancelled = false;
+let canceled = false;
 
-self.onmessage = async (event: MessageEvent<WorkerInMessage>) => {
-  const msg = event.data;
+self.onmessage = async (e: MessageEvent<WorkerInMessage>) => {
+  const msg = e.data;
 
   if (msg.type === "cancel") {
-    cancelled = true;
+    canceled = true;
     return;
   }
 
-  if (msg.type !== "start") return;
+  if (msg.type === "start") {
+    canceled = false;
+    const { file, mediaId, chunkSize, startChunkIndex, endChunkIndex, totalChunks } = msg;
 
-  cancelled = false;
-  const { file, mediaId, chunkSize } = msg;
+    try {
+      for (let i = startChunkIndex; i < endChunkIndex; i++) {
+        if (canceled) break;
 
-  try {
-    (self as unknown as Worker).postMessage({ type: "ready" } satisfies WorkerOutMessage);
+        const start = i * chunkSize;
+        const end = Math.min(start + chunkSize, file.size);
+        const slice = file.slice(start, end);
+        const buffer = await slice.arrayBuffer();
+        const data = new Uint8Array(buffer);
 
-    const total = Math.ceil(file.size / chunkSize);
-    // We stream-hash the whole file for the final checksum using the same FNV algorithm
-    // rather than accumulating all bytes (saves memory for large files).
-    const FNV_OFFSET = 14695981039346656037n;
-    const FNV_PRIME = 1099511628211n;
-    const MASK = 0xFFFFFFFFFFFFFFFFn;
-    let fileHash = FNV_OFFSET;
+        const cSum = chunkChecksum(i, data);
 
-    for (let index = 0; index < total; index++) {
-      if (cancelled) return;
-
-      const start = index * chunkSize;
-      const end = Math.min(start + chunkSize, file.size);
-      const slice = file.slice(start, end);
-      const buffer = await slice.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-
-      // Update running whole-file hash
-      for (const byte of bytes) {
-        fileHash = (fileHash ^ BigInt(byte)) & MASK;
-        fileHash = (fileHash * FNV_PRIME) & MASK;
+        // Send chunk back to main thread
+        // We use transferables to avoid copying the buffer again
+        (self as any).postMessage(
+          {
+            type: "chunk",
+            mediaId,
+            index: i,
+            total: totalChunks,
+            data,
+            checksum: cSum
+          } satisfies WorkerOutMessage,
+          [data.buffer]
+        );
       }
 
-      const checksum = chunkChecksum(index, bytes);
-
-      (self as unknown as Worker).postMessage({
-        type: "chunk",
-        mediaId,
-        index,
-        total,
-        data: bytes,
-        checksum
-      } satisfies WorkerOutMessage, [bytes.buffer]);
-
-      // Progress report every 16 chunks (~1 MB at 64 KB chunk size)
-      if (index % 16 === 0 || index === total - 1) {
-        (self as unknown as Worker).postMessage({
-          type: "progress",
-          index,
-          total
+      if (!canceled) {
+        (self as any).postMessage({
+          type: "worker_done",
+          mediaId,
+          workerStartChunk: startChunkIndex
         } satisfies WorkerOutMessage);
       }
+    } catch (err: any) {
+      (self as any).postMessage({
+        type: "error",
+        mediaId,
+        error: err?.message || String(err)
+      } satisfies WorkerOutMessage);
     }
-
-    const fileChecksum = fileHash.toString(16).padStart(16, "0");
-
-    (self as unknown as Worker).postMessage({
-      type: "end",
-      mediaId,
-      checksum: fileChecksum
-    } satisfies WorkerOutMessage);
-  } catch (err) {
-    (self as unknown as Worker).postMessage({
-      type: "error",
-      message: err instanceof Error ? err.message : "Unknown file worker error"
-    } satisfies WorkerOutMessage);
   }
 };
+
+// Signal main thread we are loaded
+(self as any).postMessage({ type: "ready" } satisfies WorkerOutMessage);

@@ -1,3 +1,5 @@
+import type { MediaFormat, MediaKind } from "../media/mediaTypes";
+
 export type PlaybackSnapshot = {
   mediaId: string | null;
   position: number;
@@ -11,17 +13,21 @@ export type FileMeta = {
   fileName: string;
   fileSize: number;
   mimeType: string;
+  format: MediaFormat;
   /** true = full blob transfer (MKV etc.), false = MSE progressive stream */
   isBlob: boolean;
+  duration?: number;
   totalChunks: number;
 };
+
+export const CHUNK_SIZE = 64 * 1024;
 
 export type RemoteMediaMount = {
   id: string;
   title: string;
   sourceUrl: string;
-  kind: "audio" | "video" | "unknown";
-  format: "direct" | "hls" | "dash" | "unknown";
+  kind: MediaKind;
+  format: MediaFormat;
   origin: "remote-url";
 };
 

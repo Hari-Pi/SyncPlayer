@@ -19,6 +19,7 @@ export type FileSendProgress = {
   fileName: string;
   chunksSent: number;
   total: number;
+  totalBytes: number;
 };
 
 export type FileReceiveProgress = {
@@ -26,6 +27,7 @@ export type FileReceiveProgress = {
   fileName: string;
   chunksReceived: number;
   total: number;
+  totalBytes: number;
 };
 
 type PeerRoomOptions = {
@@ -309,6 +311,12 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     };
   }, []);
 
+  const sendToOne = useCallback((conn: DataConnection, type: WireMessage["type"], payload: WireMessage["payload"]) => {
+    if (!conn.open) return;
+    conn.send({ id: crypto.randomUUID(), type, sentAt: performance.now(), payload });
+    setMessagesSent((c) => c + 1);
+  }, []);
+
   const send = useCallback((type: WireMessage["type"], payload: WireMessage["payload"]) => {
     const conns = connectionsRef.current;
     if (conns.length === 0) return false;
@@ -320,19 +328,20 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       payload
     };
 
+    let sent = false;
+    const seenPeers = new Set<string>();
+    
     conns.forEach((conn) => {
-      if (conn.open) conn.send(message);
+      if (conn.open && !seenPeers.has(conn.peer)) {
+        seenPeers.add(conn.peer);
+        sendToOne(conn, type, payload);
+        sent = true;
+      }
     });
+    return sent;
+  }, [sendToOne]);
 
-    setMessagesSent((count) => count + conns.length);
-    return true;
-  }, []);
 
-  const sendToOne = useCallback((conn: DataConnection, type: WireMessage["type"], payload: WireMessage["payload"]) => {
-    if (!conn.open) return;
-    conn.send({ id: crypto.randomUUID(), type, sentAt: performance.now(), payload });
-    setMessagesSent((c) => c + 1);
-  }, []);
 
   const sendPlaybackState = useCallback(
     (snapshot: PlaybackSnapshot) => { send("playback.state", snapshot); },
@@ -354,7 +363,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
 
       if (message.type === "room.hello") {
         setRemotePeer((prev) =>
-          prev === "Awaiting peer" ? message.payload.label : `${prev}, ${message.payload.label}`
+          prev === "Awaiting peer" ? message.payload.label : prev.includes(message.payload.label) ? prev : `${prev}, ${message.payload.label}`
         );
         onEventRef.current("ok", "PEER LINK", `${message.payload.label} (${conn.peer}) handshake complete.`);
         return;
@@ -402,7 +411,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         if (handlers) {
           fileStreamHandlersRef.current.set(meta.mediaId, handlers);
         }
-        setFileReceiveProgress({ mediaId: meta.mediaId, fileName: meta.fileName, chunksReceived: 0, total: meta.totalChunks });
+        setFileReceiveProgress({ mediaId: meta.mediaId, fileName: meta.fileName, chunksReceived: 0, total: meta.totalChunks, totalBytes: meta.fileSize });
         return;
       }
 
@@ -412,12 +421,14 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         if (handlers) {
           const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
           handlers.onChunk(index, total, bytes, checksum);
-          const received = index + 1;
-          setFileReceiveProgress((prev) =>
-            prev?.mediaId === mediaId ? { ...prev, chunksReceived: received } : prev
-          );
-          // Echo progress back to host
-          sendToOne(conn, "file.progress", { mediaId, chunksReceived: received, total });
+          
+          setFileReceiveProgress((prev) => {
+            if (prev?.mediaId !== mediaId) return prev;
+            const newReceived = prev.chunksReceived + 1;
+            // Echo progress back to host using the new cumulative value
+            sendToOne(conn, "file.progress", { mediaId, chunksReceived: newReceived, total });
+            return { ...prev, chunksReceived: newReceived };
+          });
         }
         return;
       }
@@ -449,16 +460,15 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
    * Applies per-connection flow control via bufferedAmount watermarks.
    */
   const sendFile = useCallback(
-    async (file: File, mediaId: string, targetConn?: DataConnection) => {
-      const conns = targetConn ? [targetConn] : connectionsRef.current;
+    async (file: File, mediaId: string, targetPeerIds?: string[]) => {
+      const conns = targetPeerIds 
+        ? connectionsRef.current.filter(c => targetPeerIds.includes(c.peer)) 
+        : connectionsRef.current;
       if (conns.length === 0) return;
 
       const mimeType = file.type || "video/mp4";
-      // Raw byte slices from the file worker are NOT valid MSE segments.
-      // MSE requires fragmented MP4 (fMP4) with moov-first layout and
-      // segment-aligned chunk boundaries — local files don't meet this.
-      // Always use full-blob transfer until a remuxing step is added.
-      const isMseFriendly = false;
+      const { inferMediaFormat } = await import("@/lib/media/mediaTypes");
+      const format = inferMediaFormat(mimeType);
 
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
       const meta: FileMeta = {
@@ -466,39 +476,43 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         fileName: file.name,
         fileSize: file.size,
         mimeType,
-        isBlob: !isMseFriendly,
+        format,
+        isBlob: true,
         totalChunks
       };
 
-      setFileSendProgress({ mediaId, fileName: file.name, chunksSent: 0, total: totalChunks });
+      setFileSendProgress({ mediaId, fileName: file.name, chunksSent: 0, total: totalChunks, totalBytes: file.size });
       onEventRef.current(
         "info",
         "FILE",
-        `Starting ${isMseFriendly ? "MSE stream" : "blob transfer"} of "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB) to ${conns.length} peer(s)`
+        `Starting blob transfer of "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB) to ${conns.length} peer connection(s)`
       );
 
-      // Broadcast file.meta to all target connections
-      conns.forEach((conn) => {
-        if (conn.open) sendToOne(conn, "file.meta", meta);
+      // Group connections by peer ID for multiplexing
+      const peerConns = new Map<string, DataConnection[]>();
+      conns.forEach((c) => {
+        if (!peerConns.has(c.peer)) peerConns.set(c.peer, []);
+        peerConns.get(c.peer)!.push(c);
       });
 
-      // Spin up the Web Worker for off-thread chunking
-      const worker = new Worker(
-        new URL("../../workers/fileWorker.ts", import.meta.url),
-        { type: "module" }
-      );
+      // Broadcast file.meta to ONE connection per peer
+      peerConns.forEach((connections) => {
+        const firstOpen = connections.find(c => c.open);
+        if (firstOpen) sendToOne(firstOpen, "file.meta", meta);
+      });
 
       const chunkQueue: Array<{ index: number; total: number; data: Uint8Array; checksum: string }> = [];
-      let workerDone = false;
-      let workerError: string | null = null;
-      let finalChecksum: string | null = null;
       let drainActive = false;
       let endSent = false;
+      
+      let workersActive = 0;
+      let workersDone = 0;
+      let workerError: string | null = null;
+      let finalChecksum = "dummy-checksum";
 
       await new Promise<void>((resolve, reject) => {
-        const rejectTransfer = (error: unknown) => {
-          reject(error);
-        };
+        const rejectTransfer = (error: unknown) => reject(error);
+        const peerConnIndex = new Map<string, number>();
 
         const drainQueue = async () => {
           if (drainActive) return;
@@ -507,8 +521,16 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
           try {
             while (chunkQueue.length > 0) {
               const chunk = chunkQueue.shift()!;
-              for (const conn of conns) {
-                if (!conn.open) continue;
+              
+              // Send to each peer via round-robin over their available multiplexed connections
+              for (const [peerId, connections] of peerConns.entries()) {
+                const openConns = connections.filter(c => c.open);
+                if (openConns.length === 0) continue;
+
+                let cIdx = peerConnIndex.get(peerId) || 0;
+                let conn = openConns[cIdx % openConns.length];
+                peerConnIndex.set(peerId, cIdx + 1);
+
                 const channel = getDataChannel(conn);
                 if (channel && channel.bufferedAmount > FLOW_HIGH_WATERMARK) {
                   await waitForDrain(conn);
@@ -522,78 +544,92 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
                 });
               }
               setFileSendProgress((prev) =>
-                prev ? { ...prev, chunksSent: chunk.index + 1 } : prev
+                prev ? { ...prev, chunksSent: prev.chunksSent + 1 } : prev
               );
             }
 
-            if (workerDone && finalChecksum && !endSent) {
+            if (workersDone === workersActive && !endSent && chunkQueue.length === 0) {
               endSent = true;
-              for (const conn of conns) {
-                if (!conn.open) continue;
-                await waitForDrain(conn);
-                sendToOne(conn, "file.end", { mediaId, checksum: finalChecksum });
-                await waitForDrain(conn);
+              for (const [peerId, connections] of peerConns.entries()) {
+                const firstOpen = connections.find(c => c.open);
+                if (!firstOpen) continue;
+                await waitForDrain(firstOpen);
+                sendToOne(firstOpen, "file.end", { mediaId, checksum: finalChecksum });
+                await waitForDrain(firstOpen);
               }
-              onEventRef.current("ok", "FILE", `File "${file.name}" fully sent. Checksum: ${finalChecksum}`);
+              onEventRef.current("ok", "FILE", `File "${file.name}" fully sent.`);
               resolve();
             }
           } catch (error) {
             rejectTransfer(error);
           } finally {
             drainActive = false;
-            if (chunkQueue.length > 0 || (workerDone && finalChecksum && !endSent)) {
+            if (chunkQueue.length > 0 || (workersDone === workersActive && !endSent)) {
               void drainQueue();
             }
           }
         };
 
-        worker.onmessage = (event: MessageEvent) => {
-          const msg = event.data as { type: string; [k: string]: unknown };
+        const NUM_WORKERS = Math.min(navigator.hardwareConcurrency || 4, 8);
+        workersActive = NUM_WORKERS;
+        const chunksPerWorker = Math.ceil(totalChunks / NUM_WORKERS);
 
-          if (msg.type === "ready") return;
+        for (let w = 0; w < NUM_WORKERS; w++) {
+          const startChunkIndex = w * chunksPerWorker;
+          const endChunkIndex = Math.min(startChunkIndex + chunksPerWorker, totalChunks);
 
-          if (msg.type === "error") {
-            workerError = msg.message as string;
-            reject(new Error(workerError));
-            return;
+          if (startChunkIndex >= totalChunks) {
+             workersActive--;
+             continue;
           }
 
-          if (msg.type === "chunk") {
-            chunkQueue.push({
-              index: msg.index as number,
-              total: msg.total as number,
-              data: msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data as ArrayLike<number>),
-              checksum: msg.checksum as string
-            });
-            void drainQueue();
-          }
+          const worker = new Worker(
+            new URL("../../workers/fileWorker.ts", import.meta.url),
+            { type: "module" }
+          );
 
-          if (msg.type === "progress") {
-            const pct = Math.round(((msg.index as number) / (msg.total as number)) * 100);
-            if (pct % 10 === 0) {
-              onEventRef.current("info", "FILE", `Sending "${file.name}": ${pct}% (${msg.index as number}/${msg.total as number} chunks)`);
+          worker.onmessage = (event: MessageEvent) => {
+            const msg = event.data as { type: string; [k: string]: unknown };
+            if (msg.type === "ready") return;
+            if (msg.type === "error") {
+              workerError = msg.error as string;
+              reject(new Error(workerError));
+              return;
             }
-          }
+            if (msg.type === "chunk") {
+              chunkQueue.push({
+                index: msg.index as number,
+                total: msg.total as number,
+                data: msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data as ArrayLike<number>),
+                checksum: msg.checksum as string
+              });
+              chunkQueue.sort((a, b) => a.index - b.index);
+              void drainQueue();
+            }
+            if (msg.type === "worker_done") {
+              workersDone++;
+              worker.terminate();
+              void drainQueue();
+            }
+          };
 
-          if (msg.type === "end") {
-            finalChecksum = msg.checksum as string;
-            workerDone = true;
-            worker.terminate();
-            void drainQueue();
-          }
-        };
+          worker.onerror = (err) => reject(new Error(err.message));
 
-        worker.onerror = (err) => {
-          reject(new Error(err.message));
-        };
-
-        worker.postMessage({ type: "start", file, mediaId, chunkSize: CHUNK_SIZE });
+          worker.postMessage({ 
+            type: "start", 
+            file, 
+            mediaId, 
+            chunkSize: CHUNK_SIZE,
+            startChunkIndex,
+            endChunkIndex,
+            totalChunks
+          });
+        }
       }).catch((err: unknown) => {
         onEventRef.current("error", "FILE", `File transfer failed: ${err instanceof Error ? err.message : "unknown error"}`);
-        worker.terminate();
       });
 
-      if (!workerError && workerDone) {
+      if (!workerError && workersDone === workersActive) {
         setFileSendProgress(null);
       }
     },
@@ -622,7 +658,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
 
       conn.on("open", () => {
         connectionsRef.current.push(conn);
-        setConnectedPeers((prev) => [...prev, conn.peer]);
+        setConnectedPeers((prev) => prev.includes(conn.peer) ? prev : [...prev, conn.peer]);
         setStatus("connected");
         onEventRef.current("ok", "WEBRTC", `Connection established with ${conn.peer}. ICE success.`);
 
@@ -720,57 +756,66 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
             "WEBRTC",
             `Negotiating handshake with host: ${hostId}${relayOnly ? " via TURN relay-only ICE" : ""}`
           );
-          const conn = peer.connect(hostId, { reliable: true });
-          setupConnectionDiagnostics(conn, `Host ${hostId}`, onEventRef.current);
+          const NUM_CHANNELS = 4;
+          for (let i = 0; i < NUM_CHANNELS; i++) {
+            const conn = peer.connect(hostId, { reliable: true });
+            setupConnectionDiagnostics(conn, `Host ${hostId} [${i}]`, onEventRef.current);
 
-          conn.on("open", () => {
-            if (joinAttemptRef.current !== attemptId) return;
+            conn.on("open", () => {
+              if (joinAttemptRef.current !== attemptId) return;
 
-            connectionsRef.current.push(conn);
-            setConnectedPeers([hostId]);
-            setStatus("connected");
-            onEventRef.current("ok", "WEBRTC", `Joined room. Data channel open with host.`);
+              connectionsRef.current.push(conn);
+              if (i === 0) {
+                setConnectedPeers([hostId]);
+                setStatus("connected");
+                onEventRef.current("ok", "WEBRTC", `Joined room. Multiplexed data channels open with host.`);
+              }
 
-            conn.send({
-              id: crypto.randomUUID(),
-              type: "room.hello",
-              sentAt: performance.now(),
-              payload: { peerId: guestId, label: `Viewer (${guestId.slice(9)})` }
+              conn.send({
+                id: crypto.randomUUID(),
+                type: "room.hello",
+                sentAt: performance.now(),
+                payload: { peerId: guestId, label: `Viewer (${guestId.slice(9)})` }
+              });
             });
-          });
 
-          conn.on("data", (data) => { handleMessage(conn, data); });
+            conn.on("data", (data) => { handleMessage(conn, data); });
 
-          conn.on("iceStateChanged", (state) => {
-            const level = state === "failed" ? "error" : state === "disconnected" ? "warn" : "info";
-            onEventRef.current(level, "ICE", `Host ${hostId} ICE state: ${state}.`);
-          });
+            conn.on("iceStateChanged", (state) => {
+              const level = state === "failed" ? "error" : state === "disconnected" ? "warn" : "info";
+              onEventRef.current(level, "ICE", `Host ${hostId} [CH${i}] ICE state: ${state}.`);
+            });
 
-          conn.on("close", () => {
-            if (joinAttemptRef.current !== attemptId || ignoredCloseConnections.has(conn)) return;
+            conn.on("close", () => {
+              if (joinAttemptRef.current !== attemptId || ignoredCloseConnections.has(conn)) return;
 
-            connectionsRef.current = [];
-            setConnectedPeers([]);
-            setStatus("disconnected");
-            setRemotePeer("Awaiting peer");
-            onEventRef.current("warn", "WEBRTC", `Host (${hostId}) disconnected.`);
-          });
+              connectionsRef.current = connectionsRef.current.filter((c) => c !== conn);
+              if (connectionsRef.current.length === 0) {
+                setConnectedPeers([]);
+                setStatus("disconnected");
+                setRemotePeer("Awaiting peer");
+                onEventRef.current("warn", "WEBRTC", `Host (${hostId}) disconnected.`);
+              }
+            });
 
-          conn.on("error", (err) => {
-            onEventRef.current("error", "WEBRTC", `Data channel error: ${describeConnectionError(err)}`);
+            conn.on("error", (err) => {
+              onEventRef.current("error", "WEBRTC", `Data channel ${i} error: ${describeConnectionError(err)}`);
 
-            if (err.type === "negotiation-failed" && !relayOnly) {
-              ignoredCloseConnections.add(conn);
-              onEventRef.current("warn", "WEBRTC", "Direct ICE negotiation failed. Retrying once with TURN relay-only mode.");
-              conn.close();
-              window.setTimeout(() => {
-                startGuestPeer(true);
-              }, 500);
-              return;
-            }
-
-            setStatus("failed");
-          });
+              if (err.type === "negotiation-failed" && !relayOnly && i === 0) {
+                ignoredCloseConnections.add(conn);
+                onEventRef.current("warn", "WEBRTC", "Direct ICE negotiation failed. Retrying once with TURN relay-only mode.");
+                conn.close();
+                window.setTimeout(() => {
+                  startGuestPeer(true);
+                }, 500);
+                return;
+              }
+              
+              if (connectionsRef.current.length === 0) {
+                setStatus("failed");
+              }
+            });
+          }
         });
 
         peer.on("error", (err) => {
