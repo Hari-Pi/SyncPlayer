@@ -728,6 +728,35 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [publishSnapshot]);
 
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectCountRef = useRef(0);
+
+  useEffect(() => {
+    if (room.role !== "guest") return;
+    if (room.status !== "disconnected" && room.status !== "failed") {
+      reconnectCountRef.current = 0;
+      return;
+    }
+    if (!room.localOffer) return;
+
+    const delay = Math.min(2000 * Math.pow(2, reconnectCountRef.current), 16000);
+    reconnectCountRef.current += 1;
+
+    log("warn", "GUEST", `Connection lost. Auto-reconnecting in ${delay / 1000}s (attempt ${reconnectCountRef.current})...`);
+
+    reconnectTimerRef.current = setTimeout(() => {
+      void room.joinWithOffer(room.localOffer);
+    }, delay);
+
+    return () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [room.role, room.status, room.localOffer]);
+
   const copyActivityLogs = useCallback(() => {
     const formattedLogs = activity
       .slice()

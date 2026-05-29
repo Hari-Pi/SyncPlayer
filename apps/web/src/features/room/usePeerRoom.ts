@@ -176,26 +176,22 @@ function setupConnectionDiagnostics(
   });
 }
 
+type TurnServerArray = {
+  urls: string[];
+  username: string;
+  credential: string;
+};
+
 const rtcConfig: ExtendedRTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun.cloudflare.com:3478" },
     {
       urls: [
-        "turn:openrelay.metered.ca:80",
-        "turn:openrelay.metered.ca:443",
-        "turn:openrelay.metered.ca:443?transport=tcp"
+        "turn:eu-0.turn.peerjs.com:3478",
+        "turn:us-0.turn.peerjs.com:3478",
+        "turn:relay.backups.cz:3478"
       ],
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    },
-    {
-      urls: "turns:openrelay.metered.ca:443",
-      username: "openrelayproject",
-      credential: "openrelayproject"
-    },
-    {
-      urls: "turn:eu-0.turn.peerjs.com:3478",
       username: "peerjs",
       credential: "peerjsp"
     }
@@ -278,7 +274,6 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const fileStreamHandlersRef = useRef<Map<string, FileStreamHandlers>>(new Map());
 
   const closeRoom = useCallback(() => {
-    joinAttemptRef.current += 1;
     onEventRef.current("info", "ROOM", "Initiating room closure. Terminating all peer connections.");
     connectionsRef.current.forEach((conn) => {
       onEventRef.current("info", "WEBRTC", `Closing connection to peer: ${conn.peer}`);
