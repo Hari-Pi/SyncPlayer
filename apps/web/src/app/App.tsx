@@ -11,6 +11,7 @@ import {
   Link2,
   LogIn,
   Pause,
+  QrCode,
   Radar,
   RadioTower,
   RotateCcw,
@@ -20,12 +21,15 @@ import {
   Shield,
   Signal,
   Upload,
-  Video
+  Video,
+  X
 } from "lucide-react";
-import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Artplayer from "artplayer";
+import QRCode from "qrcode";
 import { createActivity, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
 import { usePeerRoom } from "@/features/room/usePeerRoom";
+import { useCopyFeedback } from "@/features/room/useCopyFeedback";
 import { ActivityLogPanel } from "@/components/room/ActivityLogPanel";
 import { createMediaHint, type DriftReading } from "@/lib/wasm/syncCore";
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
@@ -186,7 +190,42 @@ function createRemoteMedia(url: string): LoadedMedia {
   };
 }
 
+function QrModal({ url, onClose }: { url: string; onClose: () => void }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    if (!canvasRef.current || !url) return;
+
+    QRCode.toCanvas(canvasRef.current, url, {
+      width: 260,
+      margin: 2,
+      color: {
+        dark: "#37f3ff",
+        light: "#03070b"
+      }
+    }).catch(() => {
+      // silently fail
+    });
+  }, [url]);
+
+  return (
+    <div className="qr-overlay" onClick={onClose}>
+      <div className="qr-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="qr-modal__header">
+          <span className="qr-modal__title">Scan to Join</span>
+          <button type="button" className="qr-modal__close" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+        <canvas ref={canvasRef} className="qr-canvas" />
+        <p className="qr-modal__hint">Open the invite link on your mobile device to join the room.</p>
+      </div>
+    </div>
+  );
+}
+
 export function App() {
+  const { copyWithFeedback, isCopied } = useCopyFeedback(1800);
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const artplayerContainerRef = useRef<HTMLDivElement | null>(null);
   const artRef = useRef<Artplayer | null>(null);
@@ -216,6 +255,9 @@ export function App() {
     return typeof credential === "string" ? credential : "";
   });
   const [forceRelay, setForceRelay] = useState(() => readStoredRtcConfig()?.iceTransportPolicy === "relay");
+  const [showQr, setShowQr] = useState(false);
+  const staleBlobUrlRef = useRef<string | null>(null);
+  const guestFileRef = useRef<File | null>(null);
   const handledShareLinkRef = useRef(false);
   const localTabChannelRef = useRef<ReturnType<typeof createLocalTabChannel>>(null);
   const roleRef = useRef<"solo" | "host" | "guest">("solo");
@@ -228,7 +270,7 @@ export function App() {
   const [activity, setActivity] = useState<ActivityEntry[]>([
     createActivity("info", "BOOT", "Command deck initialized.")
   ]);
-    const [drift, setDrift] = useState<DriftReading>(emptyDrift);
+  const [drift, setDrift] = useState<DriftReading>(emptyDrift);
   const [snapshot, setSnapshot] = useState<PlaybackSnapshot>({
     mediaId: null,
     position: 0,
@@ -238,7 +280,7 @@ export function App() {
   });
 
   const log = useCallback((level: ActivityLevel, label: string, detail: string) => {
-    setActivity((entries) => [createActivity(level, label, detail), ...entries].slice(0, 12));
+    setActivity((entries) => [createActivity(level, label, detail), ...entries].slice(0, 6));
   }, []);
 
   const roomRef = useRef<ReturnType<typeof usePeerRoom> | null>(null);
@@ -308,7 +350,7 @@ export function App() {
   const handleFileStream = useCallback((meta: FileMeta): FileStreamHandlers => {
     setGuestStreamUrl((previousUrl) => {
       if (previousUrl) {
-        URL.revokeObjectURL(previousUrl);
+        staleBlobUrlRef.current = previousUrl;
       }
       return null;
     });
@@ -360,9 +402,10 @@ export function App() {
           try {
             await writableStream.close();
             const file = await opfsFileHandle.getFile();
+            guestFileRef.current = file;
             // Since `File` from OPFS is read on-demand, we can safely create an object URL!
             const url = URL.createObjectURL(file);
-            
+
             setGuestStreamUrl(url);
             setMedia({
               id: meta.mediaId,
@@ -372,7 +415,7 @@ export function App() {
               format,
               origin: "local-file", // Treat it exactly like a local file!
               sizeBytes: meta.fileSize,
-              
+
             });
             setGuestStreamMeta(null);
             log("ok", "FILE", `"${meta.fileName}" completely downloaded and mounted for playback.`);
@@ -407,7 +450,7 @@ export function App() {
 
   const handleRemoteMediaMount = useCallback((nextMedia: RemoteMediaMount) => {
     setGuestStreamUrl((previousUrl) => {
-      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      if (previousUrl) staleBlobUrlRef.current = previousUrl;
       return null;
     });
     guestMseRef.current = null;
@@ -438,15 +481,13 @@ export function App() {
 
   const isSecureOrigin = window.isSecureContext || isLocalhost();
   const roomActionLabel =
-    room.status === "connected"
-      ? "Peer Connected"
+    room.status === "connected" && room.roomCode
+      ? `Room ${room.roomCode}`
       : room.role === "host" && inviteLink
         ? "Room Hosted"
         : room.status === "pairing"
           ? "Hosting Room"
-          : "Start Room & Copy Invite";
-  const topInviteLabel = inviteLink ? "Invite Copied" : "Copy Invite Link";
-
+          : "Start Room";
   const saveTurnConfig = useCallback(() => {
     const urls = turnUrls
       .split(/\r?\n|,/)
@@ -504,13 +545,13 @@ export function App() {
     const shareableMedia: ShareMedia | null =
       media?.origin === "remote-url"
         ? {
-            id: media.id,
-            title: media.title,
-            sourceUrl: media.sourceUrl,
-            kind: media.kind,
-            format: media.format,
-            origin: media.origin
-          }
+          id: media.id,
+          title: media.title,
+          sourceUrl: media.sourceUrl,
+          kind: media.kind,
+          format: media.format,
+          origin: media.origin
+        }
         : null;
 
     const nextInviteLink = createShareUrl({
@@ -549,8 +590,6 @@ export function App() {
     },
     [log, room]
   );
-
-
 
   useEffect(() => {
     if (!isSecureOrigin) {
@@ -948,6 +987,12 @@ export function App() {
       return;
     }
 
+    // Revoke any stale blob URL now that the old ArtPlayer instance is destroyed
+    if (staleBlobUrlRef.current) {
+      URL.revokeObjectURL(staleBlobUrlRef.current);
+      staleBlobUrlRef.current = null;
+    }
+
     if (artRef.current) {
       artRef.current.destroy(true);
       artRef.current = null;
@@ -1022,16 +1067,37 @@ export function App() {
 
     artRef.current = art;
 
-    art.on("error", (error: unknown) => {
-      const detail = error instanceof Error ? error.message : "Unknown ArtPlayer error";
-      log("error", "PLAYER", `Video load failed: ${detail}`);
+    art.on("error", (error: unknown, detail?: unknown) => {
+      const ctx: Record<string, unknown> = { src: media.sourceUrl, format: media.format };
+      if (error instanceof Event && error.target) {
+        const video = error.target as HTMLVideoElement;
+        ctx.videoError = video.error ? { code: video.error.code, message: video.error.message } : null;
+        ctx.readyState = video.readyState;
+        ctx.networkState = video.networkState;
+        log("error", "PLAYER", `Video error event: readyState=${video.readyState} networkState=${video.networkState} error=${video.error ? JSON.stringify({ code: video.error.code, msg: video.error.message }) : "none"}`);
+      } else if (error instanceof Error) {
+        ctx.stack = error.stack?.slice(0, 300);
+        log("error", "PLAYER", `Video exception: ${error.message}`);
+      } else {
+        ctx.detail = String(detail ?? error);
+        log("error", "PLAYER", `Video load failed: ${String(error)} (detail: ${String(detail)})`);
+      }
+      log("warn", "PLAYER-DEBUG", `Source: ${media.sourceUrl} | Format: ${media.format} | Kind: ${media.kind} | Info: ${JSON.stringify(ctx)}`);
+
+      // Recover dead blob URLs by regenerating from the saved OPFS File reference
+      if (media.sourceUrl.startsWith("blob:") && guestFileRef.current && media.format === "direct") {
+        log("warn", "PLAYER", "Blob URL appears dead, regenerating from saved File reference...");
+        const newUrl = URL.createObjectURL(guestFileRef.current);
+        staleBlobUrlRef.current = media.sourceUrl;
+        setMedia(prev => prev ? { ...prev, sourceUrl: newUrl } : null);
+      }
     });
 
     art.on("fullscreen", (state) => {
       if (state) {
         if (screen.orientation && "lock" in screen.orientation) {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (screen.orientation as any).lock("landscape").catch(() => {});
+          (screen.orientation as any).lock("landscape").catch(() => { });
         }
       } else {
         if (screen.orientation && "unlock" in screen.orientation) {
@@ -1169,7 +1235,7 @@ export function App() {
             <div className="status-band__text-group">
               <span className="status-band__title">Connecting to Room Host...</span>
               <span className="status-band__desc">
-              Establishing automated WebRTC link to Host room <strong>{formatRoomId(room.localOffer)}</strong>. Please wait while signaling completes...
+                Establishing automated WebRTC link to Host room <strong>{formatRoomId(room.localOffer)}</strong>. Please wait while signaling completes...
               </span>
             </div>
           </div>
@@ -1232,8 +1298,6 @@ export function App() {
             <div className="metrics-grid">
               <Metric label="ROLE" value={room.role.toUpperCase()} tone={room.role === "solo" ? "normal" : "ok"} />
               <Metric label="LINK" value={room.status.toUpperCase()} tone={statusTone} />
-              <Metric label="LATENCY" value={`${room.latencyMs}ms`} tone={room.latencyMs < 90 ? "ok" : "warn"} />
-              <Metric label="PEER" value={room.remotePeer} />
             </div>
           </Panel>
 
@@ -1262,6 +1326,10 @@ export function App() {
               <Metric label="SIZE" value={formatBytes(media?.sizeBytes || 0)} />
               <Metric label="DURATION" value={formatDuration(media?.durationSecs || snapshot.duration)} />
             </div>
+            <button type="button" onClick={() => publishSnapshot(true)} style={{ marginTop: "0.6rem", width: "100%" }}>
+              <CircleDot size={14} />
+              Send Current Playback State
+            </button>
           </Panel>
         </aside>
 
@@ -1290,10 +1358,6 @@ export function App() {
                 Load URL
               </button>
             </div>
-            <button type="button" onClick={createInviteLink}>
-              <Clipboard size={15} />
-              {topInviteLabel}
-            </button>
           </div>
 
           <Panel title="Playback Surface" icon={<Video size={15} />} className="player-panel">
@@ -1349,6 +1413,13 @@ export function App() {
 
         <aside className="right-rail">
           <Panel title="Share Room" icon={<Link2 size={15} />}>
+            <div className="helper-copy">
+              <strong>How sharing works</strong>
+              <p>
+                Start a room to get your 4-digit code. Share it with viewers — or use the invite link for one-click joining.
+              </p>
+            </div>
+
             <div className="share-flow">
               <button type="button" className="primary-action" onClick={createInviteLink}>
                 <Clipboard size={15} />
@@ -1359,6 +1430,16 @@ export function App() {
                 End Room
               </button>
             </div>
+
+            {/* ── QR Code Toggle — shown when an invite link exists ── */}
+            {inviteLink && (
+              <div className="qr-toggle-row">
+                <button type="button" className="qr-toggle" onClick={() => setShowQr(true)}>
+                  <QrCode size={14} />
+                  Show QR Code
+                </button>
+              </div>
+            )}
 
             {/* ── Room Code — shown when hosting ── */}
             {room.role === "host" && room.roomCode && (
@@ -1419,15 +1500,6 @@ export function App() {
               </div>
             )}
 
-            <div className="helper-copy">
-              <strong>How sharing works</strong>
-              <p>
-                Start a room to get your 4-digit code. Share it with viewers — or use the invite link for one-click joining.
-              </p>
-            </div>
-
-
-
             {/* Host send progress bar */}
             {room.fileSendProgress && (
               <div className="stream-progress-wrap">
@@ -1443,15 +1515,6 @@ export function App() {
                 </div>
               </div>
             )}
-
-            <label className="signal-box signal-box--compact">
-              Invite link to send
-              <input readOnly value={inviteLink} placeholder="Select media, then click Start Room & Copy Invite." />
-              <button type="button" onClick={() => copyText(inviteLink)}>
-                <Clipboard size={14} />
-                Copy Invite Link
-              </button>
-            </label>
 
             <div className="connected-peers">
               <span className="section-title">Connected Viewers ({room.connectedPeers.length})</span>
@@ -1470,10 +1533,6 @@ export function App() {
               )}
             </div>
 
-            <button type="button" onClick={() => publishSnapshot(true)} style={{ marginTop: "1.2rem" }}>
-              <CircleDot size={15} />
-              Send Current Playback State
-            </button>
           </Panel>
         </aside>
       </section>
@@ -1490,6 +1549,11 @@ export function App() {
           </div>
         </Panel>
       </footer>
+
+      {/* ── QR Code Modal ── */}
+      {showQr && inviteLink && (
+        <QrModal url={inviteLink} onClose={() => setShowQr(false)} />
+      )}
     </main>
   );
 }
