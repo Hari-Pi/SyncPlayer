@@ -7,3 +7,6 @@ target
 .pnpm-store
 crates/sync-core/pkg
 apps/web/certs/*.pem
+patch*.js
+patch*.cjs
+*.patch
