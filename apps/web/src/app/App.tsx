@@ -26,7 +26,7 @@ import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "
 import Artplayer from "artplayer";
 import { createActivity, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
 import { usePeerRoom } from "@/features/room/usePeerRoom";
-import { createMediaHint, loadSyncCore, readDrift, quantisePositionSync, type DriftReading } from "@/lib/wasm/syncCore";
+import { createMediaHint, loadSyncCore, type DriftReading } from "@/lib/wasm/syncCore";
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
 import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia } from "@/lib/media/mediaTypes";
 import { createLocalTabChannel } from "@/lib/sync/localTabSync";
@@ -189,6 +189,7 @@ export function App() {
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const artplayerContainerRef = useRef<HTMLDivElement | null>(null);
   const artRef = useRef<Artplayer | null>(null);
+  const localActionLockoutRef = useRef(0);
   const remoteApplyRef = useRef(false);
   const lastBroadcastRef = useRef(0);
   const [clock, setClock] = useState(formatClock());
@@ -240,6 +241,8 @@ export function App() {
     setActivity((entries) => [createActivity(level, label, detail), ...entries].slice(0, 12));
   }, []);
 
+  const roomRef = useRef<ReturnType<typeof usePeerRoom> | null>(null);
+
   const bindMediaElement = useCallback((node: HTMLMediaElement | null) => {
     mediaRef.current = node;
   }, []);
@@ -254,6 +257,12 @@ export function App() {
         return;
       }
 
+      // Ignore incoming snapshots for a short window after a manual action to prevent 
+      // in-flight routine updates from overriding our manual local state changes.
+      if (performance.now() - localActionLockoutRef.current < 750) {
+        return;
+      }
+
       if (remoteSnapshot.mediaId !== null && remoteSnapshot.mediaId !== currentMedia.id) {
         log(
           "warn",
@@ -263,18 +272,17 @@ export function App() {
         return;
       }
 
-      // Removed strict roleRef.current === "host" blocker to allow bi-directional sync
-      const reading = await readDrift(element.currentTime, remoteSnapshot.position, latencyMs);
-      setDrift(reading);
-      remoteApplyRef.current = true;
+      const targetPosition = remoteSnapshot.paused 
+        ? remoteSnapshot.position 
+        : remoteSnapshot.position + latencyMs / 1000;
 
-      if (reading.mode === "seek" || reading.mode === "firm") {
-        element.currentTime = quantisePositionSync(remoteSnapshot.position + latencyMs / 1000, 30);
-      } else if (reading.mode === "soft") {
-        element.playbackRate = reading.rate;
-      } else {
-        element.playbackRate = remoteSnapshot.playbackRate;
+      remoteApplyRef.current = true;
+      setDrift({ driftMs: 0, mode: "hold", rate: 1.0 });
+
+      if (Math.abs(element.currentTime - targetPosition) > 1.5) {
+        element.currentTime = targetPosition;
       }
+      element.playbackRate = remoteSnapshot.playbackRate;
 
       if (remoteSnapshot.paused) {
         element.pause();
@@ -287,6 +295,11 @@ export function App() {
       window.setTimeout(() => {
         remoteApplyRef.current = false;
       }, 250);
+
+      // Immediately relay to other guests if we are the host
+      if (roomRef.current?.role === "host") {
+        roomRef.current.sendPlaybackState(remoteSnapshot);
+      }
     },
     [log] // stable: reads live media via mediaStateRef, not the closed-over state
   );
@@ -413,6 +426,11 @@ export function App() {
     onFileStream: handleFileStream,
     onMediaMount: handleRemoteMediaMount
   });
+
+  useEffect(() => {
+    roomRef.current = room;
+  }, [room]);
+
 
   useEffect(() => {
     roleRef.current = room.role;
@@ -658,6 +676,7 @@ export function App() {
       playbackRate: element.playbackRate
     };
 
+    if (isManual) localActionLockoutRef.current = performance.now();
     setSnapshot(nextSnapshot);
 
     if (now - lastBroadcastRef.current > 250 || isManual) {
@@ -1034,14 +1053,14 @@ export function App() {
       const onPause = () => handlePauseRef.current();
       const onSeeked = () => publishSnapshotRef.current(true);
       const onRateChange = () => publishSnapshotRef.current(true);
-      const onTimeUpdate = () => publishSnapshotRef.current(false);
+      // Time updates removed for pure controls sync
       const onLoadedMetadata = () => handleLoadedMetadataRef.current();
 
       video.addEventListener("play", onPlay);
       video.addEventListener("pause", onPause);
       video.addEventListener("seeked", onSeeked);
       video.addEventListener("ratechange", onRateChange);
-      video.addEventListener("timeupdate", onTimeUpdate);
+      // video.addEventListener("timeupdate", onTimeUpdate);
       video.addEventListener("loadedmetadata", onLoadedMetadata);
 
       if (video.duration) {
@@ -1053,7 +1072,7 @@ export function App() {
         video.removeEventListener("pause", onPause);
         video.removeEventListener("seeked", onSeeked);
         video.removeEventListener("ratechange", onRateChange);
-        video.removeEventListener("timeupdate", onTimeUpdate);
+        // video.removeEventListener("timeupdate", onTimeUpdate);
         video.removeEventListener("loadedmetadata", onLoadedMetadata);
       });
     });
