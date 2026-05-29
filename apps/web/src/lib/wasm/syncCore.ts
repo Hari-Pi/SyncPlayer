@@ -1,41 +1,22 @@
-import init, {
-  correction_mode,
-  drift_ms,
-  media_identity_hint,
-  suggested_rate
-} from "@sync-core-wasm";
-
-let initPromise: Promise<void> | null = null;
-
 export type DriftReading = {
   driftMs: number;
   mode: "hold" | "soft" | "firm" | "seek";
   rate: number;
 };
 
-export function loadSyncCore() {
-  initPromise ??= init();
-  return initPromise;
+/**
+ * Creates a unique 32-character hex identity hint for a media file based on its size, duration, and modified time.
+ */
+export async function createMediaHint(sizeBytes: number, durationSecs: number, modifiedMs: number): Promise<string> {
+  const data = new Uint8Array(24);
+  const view = new DataView(data.buffer);
+  
+  view.setFloat64(0, sizeBytes, true);
+  view.setFloat64(8, durationSecs, true);
+  view.setFloat64(16, modifiedMs, true);
+
+  return fnv1aHashSync(data) + fnv1aHashSync(new Uint8Array([...data].reverse()));
 }
-
-export async function readDrift(localPositionSecs: number, hostPositionSecs: number, latencyMs: number): Promise<DriftReading> {
-  await loadSyncCore();
-
-  return {
-    driftMs: drift_ms(localPositionSecs, hostPositionSecs, latencyMs),
-    mode: correction_mode(localPositionSecs, hostPositionSecs, latencyMs) as DriftReading["mode"],
-    rate: suggested_rate(localPositionSecs, hostPositionSecs, latencyMs)
-  };
-}
-
-export async function createMediaHint(sizeBytes: number, durationSecs: number, modifiedMs: number) {
-  await loadSyncCore();
-  return media_identity_hint(sizeBytes, durationSecs, modifiedMs);
-}
-
-// ─── Extended functions implemented in JS (WASM equivalents) ────────────────
-// These match the Rust implementations exactly. When Cargo/wasm-pack is
-// available the Rust versions should be swapped in for even faster execution.
 
 /** Snap a position to the nearest frame boundary. Prevents sub-frame drift fights. */
 export function quantisePositionSync(positionSecs: number, fps: number): number {
@@ -59,7 +40,7 @@ export function smoothLatencySync(samples: number[]): number {
 }
 
 /**
- * FNV-1a 64-bit hash — JS BigInt implementation, matches Rust exactly.
+ * FNV-1a 64-bit hash — JS BigInt implementation.
  * Returns a 16-char lowercase hex string.
  */
 export function fnv1aHashSync(data: Uint8Array): string {
@@ -75,7 +56,7 @@ export function fnv1aHashSync(data: Uint8Array): string {
 }
 
 /**
- * Per-chunk checksum: FNV-1a of (index_le_bytes ++ data). Matches Rust exactly.
+ * Per-chunk checksum: FNV-1a of (index_le_bytes ++ data).
  */
 export function chunkChecksumSync(index: number, data: Uint8Array): string {
   const FNV_OFFSET = 14695981039346656037n;

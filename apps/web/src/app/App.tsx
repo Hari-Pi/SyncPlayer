@@ -26,7 +26,8 @@ import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "
 import Artplayer from "artplayer";
 import { createActivity, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
 import { usePeerRoom } from "@/features/room/usePeerRoom";
-import { createMediaHint, loadSyncCore, type DriftReading } from "@/lib/wasm/syncCore";
+import { ActivityLogPanel } from "@/components/room/ActivityLogPanel";
+import { createMediaHint, type DriftReading } from "@/lib/wasm/syncCore";
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
 import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia } from "@/lib/media/mediaTypes";
 import { createLocalTabChannel } from "@/lib/sync/localTabSync";
@@ -227,8 +228,7 @@ export function App() {
   const [activity, setActivity] = useState<ActivityEntry[]>([
     createActivity("info", "BOOT", "Command deck initialized.")
   ]);
-  const [wasmReady, setWasmReady] = useState(false);
-  const [drift, setDrift] = useState<DriftReading>(emptyDrift);
+    const [drift, setDrift] = useState<DriftReading>(emptyDrift);
   const [snapshot, setSnapshot] = useState<PlaybackSnapshot>({
     mediaId: null,
     position: 0,
@@ -550,14 +550,7 @@ export function App() {
     [log, room]
   );
 
-  useEffect(() => {
-    loadSyncCore()
-      .then(() => {
-        setWasmReady(true);
-        log("ok", "WASM", "Sync core loaded.");
-      })
-      .catch(() => log("error", "WASM", "Sync core failed to load."));
-  }, [log]);
+
 
   useEffect(() => {
     if (!isSecureOrigin) {
@@ -983,6 +976,9 @@ export function App() {
       miniProgressBar: true,
       playsInline: true,
       airplay: true,
+      mutex: false,
+      autoPlayback: false,
+      lock: false,
       customType: {
         m3u8: function (video, url, artInstance) {
           import("hls.js").then(({ default: Hls }) => {
@@ -1120,7 +1116,7 @@ export function App() {
         <div className="topbar__status">
           <span>
             <Shield size={15} />
-            {wasmReady ? "WASM READY" : "WASM BOOT"}
+            "JS CORE READY"
           </span>
           <span>
             <Signal size={15} />
@@ -1483,26 +1479,7 @@ export function App() {
       </section>
 
       <footer className="bottom-console">
-        <Panel
-          title="Activity Log"
-          icon={<Activity size={15} />}
-          action={
-            <button type="button" className="panel__btn" onClick={copyActivityLogs}>
-              <Clipboard size={12} />
-              Copy Logs
-            </button>
-          }
-        >
-          <div className="log-list">
-            {activity.map((entry) => (
-              <div className={cx("log-entry", `log-entry--${entry.level}`)} key={entry.id}>
-                <span>{entry.at}</span>
-                <strong>{entry.label}</strong>
-                <p>{entry.detail}</p>
-              </div>
-            ))}
-          </div>
-        </Panel>
+        <ActivityLogPanel activity={activity} onCopyLogs={copyActivityLogs} />
 
         <Panel title="Transport Telemetry" icon={<Settings size={15} />} className="telemetry-panel">
           <div className="metrics-grid metrics-grid--wide">

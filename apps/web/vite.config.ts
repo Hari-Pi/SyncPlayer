@@ -13,8 +13,7 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "src"),
-      "@sync-core-wasm": path.resolve(__dirname, "../../crates/sync-core/pkg/sync_core.js")
+      "@": path.resolve(__dirname, "src")
     }
   },
   server: {

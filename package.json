@@ -4,12 +4,11 @@
   "version": "0.1.0",
   "description": "Peer-to-peer synchronized playback for local files and direct online media URLs.",
   "scripts": {
-    "build": "pnpm build:wasm && pnpm --filter @syncplayer/web build",
-    "build:wasm": "PATH=\"$HOME/.cargo/bin:$PATH\" wasm-pack build crates/sync-core --target web --out-dir pkg",
+    "build": "pnpm --filter @syncplayer/web build",
     "build:vercel": "pnpm --filter @syncplayer/web build && node scripts/prepare-vercel-output.mjs",
     "build:web": "pnpm --filter @syncplayer/web build",
-    "dev": "pnpm build:wasm && pnpm --filter @syncplayer/web dev",
-    "dev:https": "pnpm build:wasm && pnpm --filter @syncplayer/web dev:https",
+    "dev": "pnpm --filter @syncplayer/web dev",
+    "dev:https": "pnpm --filter @syncplayer/web dev:https",
     "typecheck": "pnpm --filter @syncplayer/web typecheck"
   },
   "packageManager": "pnpm@11.1.3",
