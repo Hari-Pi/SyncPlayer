@@ -667,6 +667,18 @@ textarea {
     grid-template-columns: 1fr;
   }
 
+  .main-stage {
+    order: 1;
+  }
+
+  .right-rail {
+    order: 2;
+  }
+
+  .left-rail {
+    order: 3;
+  }
+
   .left-rail,
   .right-rail {
     display: grid;
