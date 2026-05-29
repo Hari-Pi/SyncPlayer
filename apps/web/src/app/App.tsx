@@ -301,17 +301,11 @@ export function App() {
     setGuestStreamMeta(meta);
     log("info", "FILE", `Receiving "${meta.fileName}" (${(meta.fileSize / 1024 / 1024).toFixed(1)} MB) — ${meta.isBlob ? "full blob" : "MSE stream"} mode`);
 
-    // Set up the media state on the guest side so mediaId matches the host
+    // Set up the media state on the guest side so mediaId matches the host.
+    // For blob mode, defer the full mount until the blob is ready — setting
+    // sourceUrl to "" would cause ArtPlayer to fail loading an empty URL.
     const kind = inferMediaKind(meta.mimeType || meta.fileName);
-    setMedia({
-      id: meta.mediaId,
-      title: meta.fileName,
-      sourceUrl: "", // will be replaced when stream is ready
-      kind,
-      format: inferMediaFormat(meta.mimeType || meta.fileName),
-      origin: "remote-url",
-      sizeBytes: meta.fileSize
-    });
+    const format = inferMediaFormat(meta.mimeType || meta.fileName);
 
     if (!meta.isBlob) {
       // MSE progressive path — start playing immediately
@@ -346,7 +340,15 @@ export function App() {
       }, { once: true });
 
       setGuestStreamUrl(url);
-      setMedia((prev) => prev ? { ...prev, sourceUrl: url } : prev);
+      setMedia({
+        id: meta.mediaId,
+        title: meta.fileName,
+        sourceUrl: url,
+        kind,
+        format,
+        origin: "remote-url",
+        sizeBytes: meta.fileSize
+      });
 
       return {
         onChunk: (_index, _total, data) => {
@@ -384,7 +386,15 @@ export function App() {
           const url = URL.createObjectURL(blob);
           guestBlobChunksRef.current = [];
           setGuestStreamUrl(url);
-          setMedia((prev) => prev ? { ...prev, sourceUrl: url } : prev);
+          setMedia({
+            id: meta.mediaId,
+            title: meta.fileName,
+            sourceUrl: url,
+            kind,
+            format,
+            origin: "remote-url",
+            sizeBytes: meta.fileSize
+          });
           setGuestStreamMeta(null);
           log("ok", "FILE", `"${meta.fileName}" received and mounted for playback.`);
         }
@@ -1027,6 +1037,11 @@ export function App() {
     });
 
     artRef.current = art;
+
+    art.on("error", (error: unknown) => {
+      const detail = error instanceof Error ? error.message : "Unknown ArtPlayer error";
+      log("error", "PLAYER", `Video load failed: ${detail}`);
+    });
 
     art.on("fullscreen", (state) => {
       if (state) {

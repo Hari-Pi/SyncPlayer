@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Peer, DataConnection, type PeerJSOption } from "peerjs";
 import type { PlaybackSnapshot, WireMessage, FileMeta, RemoteMediaMount } from "@/lib/webrtc/messages";
-import { isMseCompatible } from "@/lib/media/mediaTypes";
 import { smoothLatencySync } from "@/lib/wasm/syncCore";
 
 type RoomRole = "solo" | "host" | "guest";
@@ -455,10 +454,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       if (conns.length === 0) return;
 
       const mimeType = file.type || "video/mp4";
-      // MP4 and WebM can be progressively streamed via MSE so playback starts
-      // immediately while chunks are still arriving. Non-MSE containers (MKV,
-      // AVI, MOV, etc.) must be fully received before playback can begin.
-      const isMseFriendly = isMseCompatible(mimeType) || isMseCompatible(file.name);
+      // Raw byte slices from the file worker are NOT valid MSE segments.
+      // MSE requires fragmented MP4 (fMP4) with moov-first layout and
+      // segment-aligned chunk boundaries — local files don't meet this.
+      // Always use full-blob transfer until a remuxing step is added.
+      const isMseFriendly = false;
 
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
       const meta: FileMeta = {
