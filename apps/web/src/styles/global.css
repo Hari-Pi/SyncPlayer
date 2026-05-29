@@ -709,78 +709,106 @@ textarea {
   border-color: var(--danger);
 }
 
-@media (max-width: 1180px) {
+@media (max-width: 960px) {
   .deck {
+    height: auto;
+    min-height: 100vh;
     overflow: auto;
+    padding: 0.5rem;
   }
 
-  .deck__grid,
-  .bottom-console {
-    grid-template-columns: 1fr;
+  .deck__grid {
+    flex: none;
+    overflow: visible;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
   }
 
   .main-stage {
     order: 1;
+    overflow: visible;
   }
 
   .right-rail {
     order: 2;
+    overflow: visible;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
   }
 
   .left-rail {
     order: 3;
+    overflow: visible;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
   }
 
-  .left-rail,
-  .right-rail {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-@media (max-width: 760px) {
-  .deck {
-    padding: 0.55rem;
+  .left-rail > .panel:last-child,
+  .right-rail > .panel:last-child {
+    flex: none;
+    overflow: visible;
   }
 
-  .topbar,
-  .topbar__status,
-  .control-strip,
-  .left-rail,
-  .right-rail {
-    align-items: stretch;
+  .bottom-console {
     grid-template-columns: 1fr;
+    max-height: none;
+  }
+
+  .player-panel {
+    min-height: 14rem;
+  }
+
+  .player-shell {
+    min-height: 12rem;
+  }
+
+  .log-list {
+    max-height: 20vh;
+  }
+
+  .control-strip {
+    grid-template-columns: 1fr;
+    gap: 0.4rem;
+  }
+
+  .metrics-grid--wide {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .topbar {
-    gap: 0.8rem;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    min-height: auto;
+    padding: 0.4rem 0.6rem;
   }
 
-  .topbar,
   .topbar__status {
-    flex-direction: column;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    width: 100%;
   }
 
   .topbar__status span {
     border-left: 0;
     padding-left: 0;
+    font-size: 0.62rem;
   }
 
-  .metrics-grid,
-  .metrics-grid--wide,
-  .relay-settings__actions,
-  .relay-settings__grid,
-  .share-flow {
-    grid-template-columns: 1fr;
+  .audio-stage,
+  .empty-player {
+    min-height: 6rem;
+    padding: 0.5rem;
   }
 
-  .player-panel,
-  .player-shell {
-    min-height: 18rem;
+  .audio-stage audio {
+    width: 100%;
   }
 
   .log-entry {
-    grid-template-columns: 1fr;
+    grid-template-columns: 1fr 1fr;
   }
 }
 
