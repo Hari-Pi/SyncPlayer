@@ -7,6 +7,7 @@ import {
   Clipboard,
   FileVideo,
   Gauge,
+  Github,
   Hash,
   Link2,
   LogIn,
@@ -1310,10 +1311,6 @@ export function App() {
             </div>
           </div>
           <div className="status-band__actions">
-            <button type="button" className="status-band__btn primary-action" onClick={() => copyText(inviteLink)}>
-              <Clipboard size={14} />
-              Copy Invite Link
-            </button>
             <button type="button" className="status-band__btn" onClick={room.closeRoom}>
               Cancel Room
             </button>
@@ -1449,10 +1446,17 @@ export function App() {
             </div>
 
             <div className="share-flow">
-              <button type="button" className="primary-action" onClick={createInviteLink}>
-                <Clipboard size={15} />
-                {roomActionLabel}
-              </button>
+              {room.role === "host" && inviteLink ? (
+                <button type="button" className="primary-action" onClick={() => { copyText(inviteLink); log("ok", "SHARE", "Invite link copied to clipboard."); }}>
+                  <Clipboard size={15} />
+                  Copy Invite Link
+                </button>
+              ) : (
+                <button type="button" className="primary-action" onClick={createInviteLink}>
+                  <Clipboard size={15} />
+                  {roomActionLabel}
+                </button>
+              )}
               <button type="button" onClick={room.closeRoom}>
                 <Pause size={15} />
                 End Room
@@ -1568,12 +1572,15 @@ export function App() {
       <footer className="bottom-console">
         <ActivityLogPanel activity={activity} onCopyLogs={copyActivityLogs} />
 
-        <Panel title="Transport Telemetry" icon={<Settings size={15} />} className="telemetry-panel">
-          <div className="metrics-grid metrics-grid--wide">
-            <Metric label="SENT" value={String(room.messagesSent)} />
-            <Metric label="RECEIVED" value={String(room.messagesReceived)} />
-            <Metric label="POSITION" value={formatDuration(snapshot.position)} />
-            <Metric label="RATE" value={`${snapshot.playbackRate.toFixed(2)}x`} />
+        <Panel title="About SyncPlayer" className="telemetry-panel">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', fontSize: '0.8rem', color: 'rgba(255, 255, 255, 0.7)', padding: '0.5rem' }}>
+            <p style={{ margin: 0 }}>
+              SyncPlayer is an open-source, peer-to-peer synchronized media player.
+            </p>
+            <a href="https://github.com/animegamer4422/SyncPlayer" target="_blank" rel="noreferrer" style={{ color: 'var(--brand-primary)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+              <Github size={15} style={{ transform: 'translateY(1px)' }} />
+              <span>github.com/animegamer4422/SyncPlayer</span>
+            </a>
           </div>
         </Panel>
       </footer>
