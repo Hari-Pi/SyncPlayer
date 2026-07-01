@@ -27,10 +27,12 @@ import QRCode from "qrcode";
 import { createActivity, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
 import { usePeerRoom } from "@/features/room/usePeerRoom";
 import { ActivityLogPanel } from "@/components/room/ActivityLogPanel";
+import { FileProgressBar } from "@/components/room/FileProgressBar";
 import { createMediaHint, type DriftReading } from "@/lib/wasm/syncCore";
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
 import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia } from "@/lib/media/mediaTypes";
 import { createLocalTabChannel } from "@/lib/sync/localTabSync";
+import { cx } from "@/lib/ui/cx";
 import type { PlaybackSnapshot, FileMeta, RemoteMediaMount } from "@/lib/webrtc/messages";
 import { CHUNK_SIZE } from "@/lib/webrtc/messages";
 import type { FileStreamHandlers } from "@/features/room/usePeerRoom";
@@ -66,10 +68,6 @@ function readDrift(driftSecs: number, hostRate: number): DriftReading {
     return { driftMs, mode: "firm", rate: hostRate * (driftMs > 0 ? 1 - FIRM_RATE : 1 + FIRM_RATE) };
   }
   return { driftMs, mode: "seek", rate: hostRate };
-}
-
-function cx(...parts: Array<string | false | null | undefined>) {
-  return parts.filter(Boolean).join(" ");
 }
 
 function Panel({
@@ -258,6 +256,8 @@ export function App() {
   const [showQr, setShowQr] = useState(false);
   const staleBlobUrlRef = useRef<string | null>(null);
   const guestFileRef = useRef<File | null>(null);
+  const opfsFileHandleRef = useRef<FileSystemFileHandle | null>(null);
+  const opfsFileNameRef = useRef<string | null>(null);
   const handledShareLinkRef = useRef(false);
   const localTabChannelRef = useRef<ReturnType<typeof createLocalTabChannel>>(null);
   const manualPauseTimesRef = useRef<number[]>([]);
@@ -351,8 +351,21 @@ export function App() {
     [log] // stable: reads live media via mediaStateRef, not the closed-over state
   );
 
+  // Delete the previous OPFS transfer file so abandoned files don't accumulate.
+  const cleanupOpfsFile = useCallback(() => {
+    const fileName = opfsFileNameRef.current;
+    opfsFileNameRef.current = null;
+    opfsFileHandleRef.current = null;
+    guestFileRef.current = null;
+    if (!fileName) return;
+    navigator.storage.getDirectory().then((root) => {
+      root.removeEntry(fileName).catch(() => { /* file may not exist */ });
+    }).catch(() => { /* OPFS unavailable */ });
+  }, []);
+
   // ── Guest file stream receiver ─────────────────────────────────────────────
   const handleFileStream = useCallback((meta: FileMeta): FileStreamHandlers => {
+    cleanupOpfsFile();
     setGuestStreamUrl((previousUrl) => {
       if (previousUrl) {
         staleBlobUrlRef.current = previousUrl;
@@ -364,18 +377,53 @@ export function App() {
 
     const kind = inferMediaKind(meta.mimeType || meta.fileName);
     const format = meta.format;
+    const opfsFileName = `syncplayer-transfer-${meta.mediaId}`;
 
     let opfsFileHandle: FileSystemFileHandle | null = null;
     let writableStream: FileSystemWritableFileStream | null = null;
     let writeQueue: Promise<void> = Promise.resolve();
     let aborted = false;
+    let receivedChunks = 0;
+    let endPending = false;
+    let finalized = false;
+
+    const finalizeFile = () => {
+      if (finalized || aborted) return;
+      finalized = true;
+
+      writeQueue = writeQueue.then(async () => {
+        if (!writableStream || !opfsFileHandle) return;
+        try {
+          await writableStream.close();
+          const file = await opfsFileHandle.getFile();
+          guestFileRef.current = file;
+          opfsFileHandleRef.current = opfsFileHandle;
+          opfsFileNameRef.current = opfsFileName;
+          const url = URL.createObjectURL(file);
+
+          setGuestStreamUrl(url);
+          setMedia({
+            id: meta.mediaId,
+            title: meta.fileName,
+            sourceUrl: url,
+            kind,
+            format,
+            origin: "local-file",
+            sizeBytes: meta.fileSize,
+          });
+          setGuestStreamMeta(null);
+          log("ok", "FILE", `"${meta.fileName}" completely downloaded and mounted for playback.`);
+        } catch (err) {
+          log("error", "FILE", `Failed to finalize file transfer: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      });
+    };
 
     // Initialize OPFS
     writeQueue = writeQueue.then(async () => {
       try {
         const root = await navigator.storage.getDirectory();
-        // Create a unique temporary file
-        opfsFileHandle = await root.getFileHandle(`syncplayer-transfer-${meta.mediaId}`, { create: true });
+        opfsFileHandle = await root.getFileHandle(opfsFileName, { create: true });
         writableStream = await opfsFileHandle.createWritable();
       } catch (err) {
         log("error", "FILE", `Failed to initialize OPFS storage: ${err instanceof Error ? err.message : String(err)}`);
@@ -385,9 +433,9 @@ export function App() {
 
     return {
       onChunk: (index, _total, data) => {
-        if (aborted) return;
+        if (aborted || finalized) return;
         writeQueue = writeQueue.then(async () => {
-          if (!writableStream || aborted) return;
+          if (!writableStream || aborted || finalized) return;
           try {
             await writableStream.write({
               type: "write",
@@ -399,38 +447,21 @@ export function App() {
             aborted = true;
           }
         });
+        receivedChunks++;
+        if (endPending && receivedChunks >= meta.totalChunks) {
+          finalizeFile();
+        }
       },
       onEnd: () => {
         if (aborted) return;
-        writeQueue = writeQueue.then(async () => {
-          if (!writableStream || !opfsFileHandle) return;
-          try {
-            await writableStream.close();
-            const file = await opfsFileHandle.getFile();
-            guestFileRef.current = file;
-            // Since `File` from OPFS is read on-demand, we can safely create an object URL!
-            const url = URL.createObjectURL(file);
-
-            setGuestStreamUrl(url);
-            setMedia({
-              id: meta.mediaId,
-              title: meta.fileName,
-              sourceUrl: url,
-              kind,
-              format,
-              origin: "local-file", // Treat it exactly like a local file!
-              sizeBytes: meta.fileSize,
-
-            });
-            setGuestStreamMeta(null);
-            log("ok", "FILE", `"${meta.fileName}" completely downloaded and mounted for playback.`);
-          } catch (err) {
-            log("error", "FILE", `Failed to finalize file transfer: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        });
+        if (receivedChunks >= meta.totalChunks) {
+          finalizeFile();
+        } else {
+          endPending = true;
+        }
       }
     };
-  }, [log]);
+  }, [cleanupOpfsFile, log]);
 
   const mountRemoteMedia = useCallback(
     (url: string, source: "manual" | "invite") => {
@@ -454,6 +485,7 @@ export function App() {
   );
 
   const handleRemoteMediaMount = useCallback((nextMedia: RemoteMediaMount) => {
+    cleanupOpfsFile();
     setGuestStreamUrl((previousUrl) => {
       if (previousUrl) staleBlobUrlRef.current = previousUrl;
       return null;
@@ -464,7 +496,7 @@ export function App() {
     setMedia(nextMedia);
     setDrift(emptyDrift);
     log("ok", "MEDIA", `${nextMedia.title} mounted from host.`);
-  }, [log]);
+  }, [cleanupOpfsFile, log]);
 
   const room = usePeerRoom({
     onPlaybackState: handleRemotePlayback,
@@ -768,6 +800,7 @@ export function App() {
       }
       event.currentTarget.value = "";
 
+      cleanupOpfsFile();
       hostFileRef.current = file;
       const sourceUrl = URL.createObjectURL(file);
       const id = await createMediaHint(file.size, 0, file.lastModified);
@@ -1056,12 +1089,18 @@ export function App() {
       }
       log("warn", "PLAYER-DEBUG", `Source: ${media.sourceUrl} | Format: ${media.format} | Kind: ${media.kind} | Info: ${JSON.stringify(ctx)}`);
 
-      // Recover dead blob URLs by regenerating from the saved OPFS File reference
-      if (media.sourceUrl.startsWith("blob:") && guestFileRef.current && media.format === "direct") {
-        log("warn", "PLAYER", "Blob URL appears dead, regenerating from saved File reference...");
-        const newUrl = URL.createObjectURL(guestFileRef.current);
-        staleBlobUrlRef.current = media.sourceUrl;
-        setMedia(prev => prev ? { ...prev, sourceUrl: newUrl } : null);
+      // Recover dead blob URLs by regenerating from the persisted OPFS file handle.
+      // The handle stays alive in a ref, so getFile() returns a fresh lazy File.
+      if (media.sourceUrl.startsWith("blob:") && opfsFileHandleRef.current) {
+        log("warn", "PLAYER", "Blob URL appears dead, regenerating from OPFS file handle...");
+        opfsFileHandleRef.current.getFile().then((file) => {
+          const newUrl = URL.createObjectURL(file);
+          guestFileRef.current = file;
+          staleBlobUrlRef.current = media.sourceUrl;
+          setMedia(prev => prev ? { ...prev, sourceUrl: newUrl } : null);
+        }).catch(() => {
+          log("error", "PLAYER", "Failed to regenerate blob URL from OPFS handle.");
+        });
       }
     });
 
@@ -1339,19 +1378,15 @@ export function App() {
 
           <Panel title="Playback Surface" icon={<Video size={15} />} className="player-panel">
             {/* Guest receive progress bar */}
-            {guestStreamMeta && (
-              <div className="stream-progress-wrap" style={{ marginBottom: "1rem" }}>
-                <div className="stream-progress-label">
-                  <span>{guestStreamMeta.isBlob ? "Receiving file" : "Streaming"}: <strong>{guestStreamMeta.fileName}</strong></span>
-                  <span>{room.fileReceiveProgress ? `${Math.round((room.fileReceiveProgress.chunksReceived / room.fileReceiveProgress.total) * 100)}% of ${formatBytes(room.fileReceiveProgress.totalBytes)}` : ""}</span>
-                </div>
-                <div className="stream-progress-bar">
-                  <div
-                    className="stream-progress-bar__fill"
-                    style={{ width: room.fileReceiveProgress ? `${(room.fileReceiveProgress.chunksReceived / room.fileReceiveProgress.total) * 100}%` : "0%" }}
-                  />
-                </div>
-              </div>
+            {guestStreamMeta && room.fileReceiveProgress && (
+              <FileProgressBar
+                label={guestStreamMeta.isBlob ? "Receiving file" : "Streaming"}
+                fileName={guestStreamMeta.fileName}
+                chunksDone={room.fileReceiveProgress.chunksReceived}
+                total={room.fileReceiveProgress.total}
+                totalBytes={room.fileReceiveProgress.totalBytes}
+                style={{ marginBottom: "1rem" }}
+              />
             )}
             <div className="player-shell">
               {media ? (
@@ -1485,18 +1520,13 @@ export function App() {
 
             {/* Host send progress bar */}
             {room.fileSendProgress && (
-              <div className="stream-progress-wrap">
-                <div className="stream-progress-label">
-                  <span>Streaming to peers: <strong>{room.fileSendProgress.fileName}</strong></span>
-                  <span>{Math.round((room.fileSendProgress.chunksSent / room.fileSendProgress.total) * 100)}% of {formatBytes(room.fileSendProgress.totalBytes)}</span>
-                </div>
-                <div className="stream-progress-bar">
-                  <div
-                    className="stream-progress-bar__fill"
-                    style={{ width: `${(room.fileSendProgress.chunksSent / room.fileSendProgress.total) * 100}%` }}
-                  />
-                </div>
-              </div>
+              <FileProgressBar
+                label="Streaming to peers"
+                fileName={room.fileSendProgress.fileName}
+                chunksDone={room.fileSendProgress.chunksSent}
+                total={room.fileSendProgress.total}
+                totalBytes={room.fileSendProgress.totalBytes}
+              />
             )}
 
             <div className="connected-peers">

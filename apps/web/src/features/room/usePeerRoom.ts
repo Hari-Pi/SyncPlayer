@@ -249,10 +249,12 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const onEventRef = useRef(onEvent);
   const onFileStreamRef = useRef(onFileStream);
   const onMediaMountRef = useRef(onMediaMount);
-  useEffect(() => { onPlaybackStateRef.current = onPlaybackState; }, [onPlaybackState]);
-  useEffect(() => { onEventRef.current = onEvent; }, [onEvent]);
-  useEffect(() => { onFileStreamRef.current = onFileStream; }, [onFileStream]);
-  useEffect(() => { onMediaMountRef.current = onMediaMount; }, [onMediaMount]);
+  useEffect(() => {
+    onPlaybackStateRef.current = onPlaybackState;
+    onEventRef.current = onEvent;
+    onFileStreamRef.current = onFileStream;
+    onMediaMountRef.current = onMediaMount;
+  }, [onPlaybackState, onEvent, onFileStream, onMediaMount]);
 
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<DataConnection[]>([]);
@@ -411,7 +413,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         if (handlers) {
           handlers.onEnd(checksum);
           fileStreamHandlersRef.current.delete(mediaId);
-          onEventRef.current("ok", "FILE", `File stream complete. Checksum: ${checksum}`);
+          onEventRef.current("ok", "FILE", `File stream complete.`);
         }
         setFileReceiveProgress(null);
         return;
@@ -480,7 +482,6 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       let workersActive = 0;
       let workersDone = 0;
       let workerError: string | null = null;
-      let finalChecksum = "dummy-checksum";
 
       await new Promise<void>((resolve, reject) => {
         const rejectTransfer = (error: unknown) => reject(error);
@@ -526,7 +527,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
                 const firstOpen = connections.find(c => c.open);
                 if (!firstOpen) continue;
                 await waitForDrain(firstOpen);
-                sendToOne(firstOpen, "file.end", { mediaId, checksum: finalChecksum });
+                sendToOne(firstOpen, "file.end", { mediaId, checksum: "" });
                 await waitForDrain(firstOpen);
               }
               onEventRef.current("ok", "FILE", `File "${file.name}" fully sent.`);

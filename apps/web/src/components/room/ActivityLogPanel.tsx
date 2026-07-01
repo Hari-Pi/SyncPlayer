@@ -1,9 +1,6 @@
 import { Activity, Clipboard } from "lucide-react";
 import type { ActivityEntry } from "@/features/activity-log/activityLog";
-
-function cx(...parts: Array<string | false | null | undefined>) {
-  return parts.filter(Boolean).join(" ");
-}
+import { cx } from "@/lib/ui/cx";
 
 export function ActivityLogPanel({
   activity,
