@@ -412,7 +412,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         const handlers = fileStreamHandlersRef.current.get(mediaId);
         if (handlers) {
           handlers.onEnd(checksum);
-          fileStreamHandlersRef.current.delete(mediaId);
+          setTimeout(() => fileStreamHandlersRef.current.delete(mediaId), 10000);
           onEventRef.current("ok", "FILE", `File stream complete.`);
         }
         setFileReceiveProgress(null);
