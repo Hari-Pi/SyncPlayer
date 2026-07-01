@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Peer, DataConnection, type PeerJSOption } from "peerjs";
-import type { PlaybackSnapshot, WireMessage, FileMeta, RemoteMediaMount } from "@/lib/webrtc/messages";
+import type { PlaybackSnapshot, WireMessage, FileMeta, RemoteMediaMount, PlaybackConfig } from "@/lib/webrtc/messages";
 import { CHUNK_SIZE } from "@/lib/webrtc/messages";
 import { smoothLatencySync } from "@/lib/wasm/syncCore";
 
@@ -36,6 +36,9 @@ type PeerRoomOptions = {
   onEvent: (level: "info" | "ok" | "warn" | "error", label: string, detail: string) => void;
   onFileStream?: (meta: FileMeta) => FileStreamHandlers;
   onMediaMount?: (media: RemoteMediaMount) => void;
+  onConfigRequest?: (conn: DataConnection) => void;
+  onConfigState?: (config: PlaybackConfig) => void;
+  onConfigChanged?: () => void;
 };
 
 function readStoredPeerOptions() {
@@ -231,7 +234,7 @@ function genRoomCode(): string {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
-export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMount }: PeerRoomOptions) {
+export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged }: PeerRoomOptions) {
   const [role, setRole] = useState<RoomRole>("solo");
   const [status, setStatus] = useState<LinkStatus>("idle");
   const [localOffer, setLocalOffer] = useState("");
@@ -249,12 +252,18 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const onEventRef = useRef(onEvent);
   const onFileStreamRef = useRef(onFileStream);
   const onMediaMountRef = useRef(onMediaMount);
+  const onConfigRequestRef = useRef(onConfigRequest);
+  const onConfigStateRef = useRef(onConfigState);
+  const onConfigChangedRef = useRef(onConfigChanged);
   useEffect(() => {
     onPlaybackStateRef.current = onPlaybackState;
     onEventRef.current = onEvent;
     onFileStreamRef.current = onFileStream;
     onMediaMountRef.current = onMediaMount;
-  }, [onPlaybackState, onEvent, onFileStream, onMediaMount]);
+    onConfigRequestRef.current = onConfigRequest;
+    onConfigStateRef.current = onConfigState;
+    onConfigChangedRef.current = onConfigChanged;
+  }, [onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged]);
 
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<DataConnection[]>([]);
@@ -325,6 +334,21 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
 
   const sendMediaMount = useCallback(
     (media: RemoteMediaMount) => { send("media.mount", media); },
+    [send]
+  );
+
+  const sendConfigRequest = useCallback(
+    () => { send("config.request", {}); },
+    [send]
+  );
+
+  const sendConfigState = useCallback(
+    (conn: DataConnection, config: PlaybackConfig) => { sendToOne(conn, "config.state", config); },
+    [sendToOne]
+  );
+
+  const broadcastConfigChanged = useCallback(
+    () => { send("config.changed", {}); },
     [send]
   );
 
@@ -422,6 +446,21 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       if (message.type === "file.progress") {
         const { chunksReceived, total } = message.payload;
         setFileSendProgress((prev) => prev ? { ...prev, chunksSent: chunksReceived, total } : prev);
+        return;
+      }
+
+      if (message.type === "config.request") {
+        onConfigRequestRef.current?.(conn);
+        return;
+      }
+
+      if (message.type === "config.state") {
+        onConfigStateRef.current?.(message.payload);
+        return;
+      }
+
+      if (message.type === "config.changed") {
+        onConfigChangedRef.current?.();
         return;
       }
     },
@@ -824,6 +863,9 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     pingPeer,
     sendPlaybackState,
     sendMediaMount,
+    sendConfigRequest,
+    sendConfigState,
+    broadcastConfigChanged,
     sendFile
   };
 }

@@ -21,6 +21,11 @@ export type FileMeta = {
 
 export const CHUNK_SIZE = 64 * 1024;
 
+export type PlaybackConfig = {
+  subtitleTrack: number; // -1 = off, 0+ = embedded track index
+  qualityLevel: number;  // -1 = auto ABR, 0+ = level/representation index
+};
+
 export type RemoteMediaMount = {
   id: string;
   title: string;
@@ -97,4 +102,22 @@ export type WireMessage =
         chunksReceived: number;
         total: number;
       };
+    }
+  | {
+      id: string;
+      type: "config.request";
+      sentAt: number;
+      payload: Record<string, never>;
+    }
+  | {
+      id: string;
+      type: "config.state";
+      sentAt: number;
+      payload: PlaybackConfig;
+    }
+  | {
+      id: string;
+      type: "config.changed";
+      sentAt: number;
+      payload: Record<string, never>;
     };

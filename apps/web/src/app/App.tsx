@@ -33,8 +33,9 @@ import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
 import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia } from "@/lib/media/mediaTypes";
 import { createLocalTabChannel } from "@/lib/sync/localTabSync";
 import { cx } from "@/lib/ui/cx";
-import type { PlaybackSnapshot, FileMeta, RemoteMediaMount } from "@/lib/webrtc/messages";
+import type { PlaybackSnapshot, FileMeta, RemoteMediaMount, PlaybackConfig } from "@/lib/webrtc/messages";
 import { CHUNK_SIZE } from "@/lib/webrtc/messages";
+import type { DataConnection } from "peerjs";
 import type { FileStreamHandlers } from "@/features/room/usePeerRoom";
 
 const emptyDrift: DriftReading = {
@@ -241,6 +242,12 @@ export function App() {
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const artplayerContainerRef = useRef<HTMLDivElement | null>(null);
   const artRef = useRef<Artplayer | null>(null);
+  // Engine instances for config sync (subtitle/quality). Persisted so host can
+  // read current config and guests can apply remote config changes.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const hlsRef = useRef<any>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const dashRef = useRef<any>(null);
   const remoteApplyRef = useRef(false);
   const lastBroadcastRef = useRef(0);
   const [clock, setClock] = useState(formatClock());
@@ -349,6 +356,8 @@ export function App() {
     opfsFileNameRef.current = null;
     opfsFileHandleRef.current = null;
     guestFileRef.current = null;
+    hlsRef.current = null;
+    dashRef.current = null;
     if (!fileName) return;
     navigator.storage.getDirectory().then((root) => {
       root.removeEntry(fileName).catch(() => { /* file may not exist */ });
@@ -490,11 +499,59 @@ export function App() {
     log("ok", "MEDIA", `${nextMedia.title} mounted from host.`);
   }, [cleanupOpfsFile, log]);
 
+  // ── Config sync (subtitle + quality, pull model) ───────────────────────────
+  // Host responds to guest config requests by reading current engine state.
+  const handleConfigRequest = useCallback((conn: DataConnection) => {
+    const hls = hlsRef.current;
+    const dash = dashRef.current;
+    let config: PlaybackConfig;
+
+    if (hls) {
+      config = {
+        subtitleTrack: hls.subtitleTrack ?? -1,
+        qualityLevel: hls.currentLevel ?? -1
+      };
+    } else if (dash) {
+      config = {
+        subtitleTrack: dash.getCurrentTextTrackIndex?.() ?? -1,
+        qualityLevel: -1
+      };
+    } else {
+      config = { subtitleTrack: -1, qualityLevel: -1 };
+    }
+
+    roomRef.current?.sendConfigState(conn, config);
+  }, []);
+
+  // Guest applies config received from host.
+  const handleConfigState = useCallback((config: PlaybackConfig) => {
+    remoteApplyRef.current = true;
+    const hls = hlsRef.current;
+    const dash = dashRef.current;
+
+    if (hls) {
+      if (config.subtitleTrack >= -1) hls.subtitleTrack = config.subtitleTrack;
+      if (config.qualityLevel >= -1) hls.currentLevel = config.qualityLevel;
+    } else if (dash) {
+      if (config.subtitleTrack >= -1) dash.setTextTrack?.(config.subtitleTrack);
+    }
+
+    window.setTimeout(() => { remoteApplyRef.current = false; }, 250);
+  }, []);
+
+  // Guest requests fresh config when host signals a change.
+  const handleConfigChanged = useCallback(() => {
+    roomRef.current?.sendConfigRequest();
+  }, []);
+
   const room = usePeerRoom({
     onPlaybackState: handleRemotePlayback,
     onEvent: log,
     onFileStream: handleFileStream,
-    onMediaMount: handleRemoteMediaMount
+    onMediaMount: handleRemoteMediaMount,
+    onConfigRequest: handleConfigRequest,
+    onConfigState: handleConfigState,
+    onConfigChanged: handleConfigChanged
   });
 
   useEffect(() => {
@@ -586,6 +643,13 @@ export function App() {
       setDrift({ driftMs: room.latencyMs, mode: "hold", rate: 1 });
     }
   }, [room.role, room.status, room.latencyMs]);
+
+  // Guest: request config from host on connect
+  useEffect(() => {
+    if (room.role === "guest" && room.status === "connected") {
+      room.sendConfigRequest();
+    }
+  }, [room.role, room.status, room]);
 
   useEffect(() => {
     const channel = createLocalTabChannel((message) => {
@@ -909,16 +973,27 @@ export function App() {
           enableWorker: true,
           lowLatencyMode: true
         });
-
+        hlsRef.current = hls;
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
           log("ok", "HLS", "HLS Audio manifest parsed and attached.");
+          if (roomRef.current?.role === "host") {
+            hls.on(Hls.Events.LEVEL_SWITCHED, () => {
+              roomRef.current?.broadcastConfigChanged();
+            });
+            hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, () => {
+              roomRef.current?.broadcastConfigChanged();
+            });
+          }
         });
         hls.on(Hls.Events.ERROR, (_event, data) => {
           log(data.fatal ? "error" : "warn", "HLS", `${data.type}: ${data.details}`);
         });
         hls.loadSource(media.sourceUrl);
         hls.attachMedia(element);
-        engineCleanup = () => hls.destroy();
+        engineCleanup = () => {
+          hls.destroy();
+          hlsRef.current = null;
+        };
         return;
       }
 
@@ -935,9 +1010,23 @@ export function App() {
         }
 
         const player = dashjs.MediaPlayer().create();
+        dashRef.current = player;
         player.initialize(element, media.sourceUrl, false);
         log("ok", "DASH", "MPEG-DASH audio manifest attached.");
-        engineCleanup = () => player.reset();
+        if (roomRef.current?.role === "host") {
+          player.on(dashjs.MediaPlayer.events.QUALITY_CHANGE_RENDERED, () => {
+            roomRef.current?.broadcastConfigChanged();
+          });
+          player.on(dashjs.MediaPlayer.events.TRACK_CHANGE_RENDERED, (e: { mediaType: string }) => {
+            if (e.mediaType === "text") {
+              roomRef.current?.broadcastConfigChanged();
+            }
+          });
+        }
+        engineCleanup = () => {
+          player.reset();
+          dashRef.current = null;
+        };
         return;
       }
 
@@ -1016,15 +1105,28 @@ export function App() {
               enableWorker: true,
               lowLatencyMode: true
             });
+            hlsRef.current = hls;
             hls.loadSource(url);
             hls.attachMedia(video);
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
               log("ok", "HLS", "HLS stream manifest attached to ArtPlayer.");
+              // Host: detect quality/subtitle changes and notify guests
+              if (roomRef.current?.role === "host") {
+                hls.on(Hls.Events.LEVEL_SWITCHED, () => {
+                  roomRef.current?.broadcastConfigChanged();
+                });
+                hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, () => {
+                  roomRef.current?.broadcastConfigChanged();
+                });
+              }
             });
             hls.on(Hls.Events.ERROR, (_, data) => {
               log(data.fatal ? "error" : "warn", "HLS", `${data.type}: ${data.details}`);
             });
-            artInstance.on("destroy", () => hls.destroy());
+            artInstance.on("destroy", () => {
+              hls.destroy();
+              hlsRef.current = null;
+            });
           });
         },
         mpd: function (video, url, artInstance) {
@@ -1034,9 +1136,24 @@ export function App() {
               return;
             }
             const player = dashjs.MediaPlayer().create();
+            dashRef.current = player;
             player.initialize(video, url, false);
             log("ok", "DASH", "MPEG-DASH stream attached to ArtPlayer.");
-            artInstance.on("destroy", () => player.reset());
+            // Host: detect quality/subtitle changes and notify guests
+            if (roomRef.current?.role === "host") {
+              player.on(dashjs.MediaPlayer.events.QUALITY_CHANGE_RENDERED, () => {
+                roomRef.current?.broadcastConfigChanged();
+              });
+              player.on(dashjs.MediaPlayer.events.TRACK_CHANGE_RENDERED, (e: { mediaType: string }) => {
+                if (e.mediaType === "text") {
+                  roomRef.current?.broadcastConfigChanged();
+                }
+              });
+            }
+            artInstance.on("destroy", () => {
+              player.reset();
+              dashRef.current = null;
+            });
           });
         }
       }
