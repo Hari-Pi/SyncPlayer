@@ -16,7 +16,6 @@ export type FileMeta = {
   format: MediaFormat;
   /** true = full blob transfer (MKV etc.), false = MSE progressive stream */
   isBlob: boolean;
-  duration?: number;
   totalChunks: number;
 };
 

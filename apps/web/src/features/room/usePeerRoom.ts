@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Peer, DataConnection, type PeerJSOption } from "peerjs";
 import type { PlaybackSnapshot, WireMessage, FileMeta, RemoteMediaMount } from "@/lib/webrtc/messages";
+import { CHUNK_SIZE } from "@/lib/webrtc/messages";
 import { smoothLatencySync } from "@/lib/wasm/syncCore";
 
 type RoomRole = "solo" | "host" | "guest";
@@ -176,12 +177,6 @@ function setupConnectionDiagnostics(
   });
 }
 
-type TurnServerArray = {
-  urls: string[];
-  username: string;
-  credential: string;
-};
-
 const rtcConfig: ExtendedRTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
@@ -200,8 +195,6 @@ const rtcConfig: ExtendedRTCConfiguration = {
   iceTransportPolicy: "all"
 };
 
-// 64 KB chunks — optimal for WebRTC DataChannel throughput
-const CHUNK_SIZE = 64 * 1024;
 // Pause sending when the channel buffer exceeds 4 MB
 const FLOW_HIGH_WATERMARK = 4 * 1024 * 1024;
 // Resume when it drains below 256 KB
@@ -242,11 +235,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const [role, setRole] = useState<RoomRole>("solo");
   const [status, setStatus] = useState<LinkStatus>("idle");
   const [localOffer, setLocalOffer] = useState("");
-  const [localAnswer, setLocalAnswer] = useState("");
   const [remotePeer, setRemotePeer] = useState("Awaiting peer");
   const [latencyMs, setLatencyMs] = useState(0);
-  const [messagesSent, setMessagesSent] = useState(0);
-  const [messagesReceived, setMessagesReceived] = useState(0);
   const [connectedPeers, setConnectedPeers] = useState<string[]>([]);
   const [fileSendProgress, setFileSendProgress] = useState<FileSendProgress | null>(null);
   const [fileReceiveProgress, setFileReceiveProgress] = useState<FileReceiveProgress | null>(null);
@@ -292,7 +282,6 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     setRemotePeer("Awaiting peer");
     setConnectedPeers([]);
     setLocalOffer("");
-    setLocalAnswer("");
     setFileSendProgress(null);
     setFileReceiveProgress(null);
     fileStreamHandlersRef.current.clear();
@@ -309,31 +298,20 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const sendToOne = useCallback((conn: DataConnection, type: WireMessage["type"], payload: WireMessage["payload"]) => {
     if (!conn.open) return;
     conn.send({ id: crypto.randomUUID(), type, sentAt: performance.now(), payload });
-    setMessagesSent((c) => c + 1);
   }, []);
 
   const send = useCallback((type: WireMessage["type"], payload: WireMessage["payload"]) => {
     const conns = connectionsRef.current;
-    if (conns.length === 0) return false;
+    if (conns.length === 0) return;
 
-    const message = {
-      id: crypto.randomUUID(),
-      type,
-      sentAt: performance.now(),
-      payload
-    };
-
-    let sent = false;
     const seenPeers = new Set<string>();
     
     conns.forEach((conn) => {
       if (conn.open && !seenPeers.has(conn.peer)) {
         seenPeers.add(conn.peer);
         sendToOne(conn, type, payload);
-        sent = true;
       }
     });
-    return sent;
   }, [sendToOne]);
 
 
@@ -353,7 +331,6 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
 
   const handleMessage = useCallback(
     (conn: DataConnection, eventData: unknown) => {
-      setMessagesReceived((count) => count + 1);
       const message = eventData as WireMessage;
 
       if (message.type === "room.hello") {
@@ -635,7 +612,6 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     closeRoom();
     setRole("host");
     setStatus("pairing");
-    setLocalAnswer("");
     setLocalOffer(peerId);
 
     onEventRef.current("info", "PEERJS", `Initializing room owner node. Host Peer ID: ${peerId}`);
@@ -703,10 +679,6 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     return peerId;
   }, [closeRoom, handleMessage, peerId]);
 
-  const acceptGuestAnswer = useCallback(async (_answerSignal: string) => {
-    onEventRef.current("info", "ROOM", "Manual signaling is deprecated. Connections now occur automatically.");
-  }, []);
-
   const joinWithOffer = useCallback(
     async (rawId: string) => {
       // Normalise: bare 4-digit code → full Peer ID (SP-XXXX)
@@ -717,7 +689,6 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       setRole("guest");
       setStatus("pairing");
       setLocalOffer(hostId);
-      setLocalAnswer("");
 
       const ignoredCloseConnections = new WeakSet<DataConnection>();
 
@@ -839,19 +810,14 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   return {
     role,
     status,
-    peerId,
     roomCode: peerId.replace(/^SP-/, ""),
     remotePeer,
     localOffer,
-    localAnswer,
     latencyMs,
-    messagesSent,
-    messagesReceived,
     connectedPeers,
     fileSendProgress,
     fileReceiveProgress,
     createHostOffer,
-    acceptGuestAnswer,
     joinWithOffer,
     closeRoom,
     pingPeer,

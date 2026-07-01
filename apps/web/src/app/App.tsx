@@ -1,8 +1,6 @@
 import {
-  Activity,
   AlertTriangle,
   AudioLines,
-  BadgeCheck,
   CircleDot,
   Clipboard,
   FileVideo,
@@ -15,10 +13,8 @@ import {
   QrCode,
   Radar,
   RadioTower,
-  RotateCcw,
   ScanLine,
   Send,
-  Settings,
   Shield,
   Signal,
   Upload,
@@ -30,7 +26,6 @@ import Artplayer from "artplayer";
 import QRCode from "qrcode";
 import { createActivity, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
 import { usePeerRoom } from "@/features/room/usePeerRoom";
-import { useCopyFeedback } from "@/features/room/useCopyFeedback";
 import { ActivityLogPanel } from "@/components/room/ActivityLogPanel";
 import { createMediaHint, type DriftReading } from "@/lib/wasm/syncCore";
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
@@ -195,15 +190,6 @@ function writeStoredRtcConfig(config: ShareRtcConfig | null) {
   localStorage.setItem("syncplayer:rtcconfig", JSON.stringify(config));
 }
 
-function getPrimaryIceServer(config: ShareRtcConfig | null) {
-  return config?.iceServers?.[0] ?? null;
-}
-
-function getIceServerUrls(server: RTCIceServer | null) {
-  if (!server?.urls) return "";
-  return Array.isArray(server.urls) ? server.urls.join("\n") : server.urls;
-}
-
 function createRemoteMedia(url: string): LoadedMedia {
   const parsedUrl = new URL(url);
   const format = inferMediaFormat(url);
@@ -253,7 +239,6 @@ function QrModal({ url, onClose }: { url: string; onClose: () => void }) {
 }
 
 export function App() {
-  const { copyWithFeedback, isCopied } = useCopyFeedback(1800);
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const artplayerContainerRef = useRef<HTMLDivElement | null>(null);
   const artRef = useRef<Artplayer | null>(null);
@@ -268,31 +253,15 @@ export function App() {
   useEffect(() => { mediaStateRef.current = media; }, [media]);
   const [remoteUrl, setRemoteUrl] = useState("");
   const [inviteLink, setInviteLink] = useState("");
-  const [responseLink, setResponseLink] = useState("");
-  const [responseInput, setResponseInput] = useState("");
   const [joinCode, setJoinCode] = useState("");
-  const [localTabPeer, setLocalTabPeer] = useState("No local tab");
   const [openedThroughRoomLink, setOpenedThroughRoomLink] = useState(false);
-  const [turnUrls, setTurnUrls] = useState(() => getIceServerUrls(getPrimaryIceServer(readStoredRtcConfig())));
-  const [turnUsername, setTurnUsername] = useState(() => {
-    const username = getPrimaryIceServer(readStoredRtcConfig())?.username;
-    return typeof username === "string" ? username : "";
-  });
-  const [turnCredential, setTurnCredential] = useState(() => {
-    const credential = getPrimaryIceServer(readStoredRtcConfig())?.credential;
-    return typeof credential === "string" ? credential : "";
-  });
-  const [forceRelay, setForceRelay] = useState(() => readStoredRtcConfig()?.iceTransportPolicy === "relay");
   const [showQr, setShowQr] = useState(false);
   const staleBlobUrlRef = useRef<string | null>(null);
   const guestFileRef = useRef<File | null>(null);
   const handledShareLinkRef = useRef(false);
   const localTabChannelRef = useRef<ReturnType<typeof createLocalTabChannel>>(null);
-  const roleRef = useRef<"solo" | "host" | "guest">("solo");
   const manualPauseTimesRef = useRef<number[]>([]);
   const hostFileRef = useRef<File | null>(null);
-  const guestMseRef = useRef<{ ms: MediaSource; sb: SourceBuffer; queue: ArrayBuffer[]; updating: boolean } | null>(null);
-  const guestBlobChunksRef = useRef<ArrayBuffer[]>([]);
   const [guestStreamUrl, setGuestStreamUrl] = useState<string | null>(null);
   const [guestStreamMeta, setGuestStreamMeta] = useState<FileMeta | null>(null);
   const [activity, setActivity] = useState<ActivityEntry[]>([
@@ -354,7 +323,7 @@ export function App() {
       if (roomRef.current?.role === "guest") {
         setDrift(readDrift(element.currentTime - targetPosition, remoteSnapshot.playbackRate));
       } else {
-        setDrift({ driftMs: 0, mode: "hold", rate: 1.0 });
+        setDrift(emptyDrift);
       }
 
       if (Math.abs(element.currentTime - targetPosition) > 1.5) {
@@ -489,8 +458,6 @@ export function App() {
       if (previousUrl) staleBlobUrlRef.current = previousUrl;
       return null;
     });
-    guestMseRef.current = null;
-    guestBlobChunksRef.current = [];
     setGuestStreamMeta(null);
     hostFileRef.current = null;
     setRemoteUrl(nextMedia.sourceUrl);
@@ -510,11 +477,6 @@ export function App() {
     roomRef.current = room;
   }, [room]);
 
-
-  useEffect(() => {
-    roleRef.current = room.role;
-  }, [room.role]);
-
   const isSecureOrigin = window.isSecureContext || isLocalhost();
   const roomActionLabel =
     room.status === "connected" && room.roomCode
@@ -524,42 +486,6 @@ export function App() {
         : room.status === "pairing"
           ? "Hosting Room"
           : "Start Room";
-  const saveTurnConfig = useCallback(() => {
-    const urls = turnUrls
-      .split(/\r?\n|,/)
-      .map((url) => url.trim())
-      .filter(Boolean);
-
-    if (urls.length === 0) {
-      writeStoredRtcConfig(null);
-      setForceRelay(false);
-      log("warn", "ICE", "TURN relay config cleared. Public STUN/TURN fallback will be used.");
-      return;
-    }
-
-    const config: ShareRtcConfig = {
-      iceServers: [
-        {
-          urls,
-          username: turnUsername.trim() || undefined,
-          credential: turnCredential.trim() || undefined
-        }
-      ],
-      iceTransportPolicy: forceRelay ? "relay" : "all"
-    };
-
-    writeStoredRtcConfig(config);
-    log("ok", "ICE", `TURN relay config saved with ${urls.length} URL${urls.length === 1 ? "" : "s"}. Create a fresh invite link.`);
-  }, [forceRelay, log, turnCredential, turnUrls, turnUsername]);
-
-  const clearTurnConfig = useCallback(() => {
-    writeStoredRtcConfig(null);
-    setTurnUrls("");
-    setTurnUsername("");
-    setTurnCredential("");
-    setForceRelay(false);
-    log("warn", "ICE", "TURN relay config cleared. Public STUN/TURN fallback will be used.");
-  }, [log]);
 
   const handleJoinByCode = useCallback(async () => {
     const code = joinCode.replace(/\D/g, "").slice(0, 4);
@@ -609,24 +535,6 @@ export function App() {
     }
   }, [log, media, room]);
 
-  const acceptResponseLink = useCallback(
-    async (value: string) => {
-      try {
-        const payload = decodeSharePayload(value.trim());
-
-        if (payload.type !== "response") {
-          log("error", "SHARE", "That link is an invite link. Paste the viewer response link here.");
-          return;
-        }
-
-        await room.acceptGuestAnswer(payload.answer);
-      } catch {
-        log("error", "SHARE", "Could not read that response link.");
-      }
-    },
-    [log, room]
-  );
-
   useEffect(() => {
     if (!isSecureOrigin) {
       log("warn", "SECURE ORIGIN", "Mobile browsers may block WebRTC on LAN HTTP. Use localhost, HTTPS, or a trusted tunnel.");
@@ -658,7 +566,6 @@ export function App() {
   useEffect(() => {
     const channel = createLocalTabChannel((message) => {
       if (message.type === "hello") {
-        setLocalTabPeer(message.peerId);
         log("ok", "LOCAL TAB", "Another SyncPlayer tab is available for same-device testing.");
         return;
       }
@@ -701,11 +608,6 @@ export function App() {
       setOpenedThroughRoomLink(true);
       if (payload.rtcConfig) {
         writeStoredRtcConfig(payload.rtcConfig);
-        const server = getPrimaryIceServer(payload.rtcConfig);
-        setTurnUrls(getIceServerUrls(server));
-        setTurnUsername(typeof server?.username === "string" ? server.username : "");
-        setTurnCredential(typeof server?.credential === "string" ? server.credential : "");
-        setForceRelay(payload.rtcConfig.iceTransportPolicy === "relay");
         log("ok", "ICE", "TURN relay config loaded from invite link.");
       }
 
@@ -725,7 +627,6 @@ export function App() {
             answer
           });
 
-          setResponseLink(nextResponseLink);
           copyText(nextResponseLink);
           log("ok", "SHARE", "Response link copied. Send it back to the room owner.");
         })
@@ -733,7 +634,6 @@ export function App() {
       return;
     }
 
-    setResponseInput(window.location.href);
     log("info", "SHARE", "Response link detected. Paste it into the open host tab to finish connecting.");
   }, [log, mountRemoteMedia, room]);
 
@@ -947,8 +847,6 @@ export function App() {
     const baseUrl = `${window.location.origin}${window.location.pathname}`;
     window.history.replaceState(null, "", baseUrl);
     setOpenedThroughRoomLink(false);
-    setResponseLink("");
-    setResponseInput("");
     log("info", "NAV", "Share URL removed from address bar.");
   }, [log]);
 
@@ -1189,14 +1087,12 @@ export function App() {
       const onPause = () => handlePauseRef.current();
       const onSeeked = () => publishSnapshotRef.current(true);
       const onRateChange = () => publishSnapshotRef.current(true);
-      // Time updates removed for pure controls sync
       const onLoadedMetadata = () => handleLoadedMetadataRef.current();
 
       video.addEventListener("play", onPlay);
       video.addEventListener("pause", onPause);
       video.addEventListener("seeked", onSeeked);
       video.addEventListener("ratechange", onRateChange);
-      // video.addEventListener("timeupdate", onTimeUpdate);
       video.addEventListener("loadedmetadata", onLoadedMetadata);
 
       if (video.duration) {
@@ -1208,7 +1104,6 @@ export function App() {
         video.removeEventListener("pause", onPause);
         video.removeEventListener("seeked", onSeeked);
         video.removeEventListener("ratechange", onRateChange);
-        // video.removeEventListener("timeupdate", onTimeUpdate);
         video.removeEventListener("loadedmetadata", onLoadedMetadata);
       });
     });
