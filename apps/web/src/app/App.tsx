@@ -43,8 +43,9 @@ const emptyDrift: DriftReading = {
   rate: 1
 };
 
-// Drift magnitude thresholds (milliseconds). Drift is informational only —
-// no playback-rate nudge is applied; these purely drive the meter's mode/tone.
+// Drift magnitude thresholds (milliseconds). Drive the meter's mode/tone and
+// the actual correction applied to guests: soft/firm nudge playbackRate, seek
+// for large drift.
 const DRIFT_HOLD_MS = 40;
 const DRIFT_SOFT_MS = 150;
 const DRIFT_FIRM_MS = 500;
@@ -52,8 +53,8 @@ const SOFT_RATE = 0.05;
 const FIRM_RATE = 0.1;
 
 // Compute a DriftReading from the signed offset between local currentTime and
-// the remote target position (both in seconds). Returns the recommended
-// correction multiplier relative to the host rate — it is displayed, not applied.
+// the remote target position (both in seconds). Returns the correction
+// multiplier relative to the host rate — applied to guests each tick.
 function readDrift(driftSecs: number, hostRate: number): DriftReading {
   const driftMs = driftSecs * 1000;
   const abs = Math.abs(driftMs);
@@ -240,7 +241,6 @@ export function App() {
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const artplayerContainerRef = useRef<HTMLDivElement | null>(null);
   const artRef = useRef<Artplayer | null>(null);
-  const localActionLockoutRef = useRef(0);
   const remoteApplyRef = useRef(false);
   const lastBroadcastRef = useRef(0);
   const [clock, setClock] = useState(formatClock());
@@ -260,7 +260,6 @@ export function App() {
   const opfsFileNameRef = useRef<string | null>(null);
   const handledShareLinkRef = useRef(false);
   const localTabChannelRef = useRef<ReturnType<typeof createLocalTabChannel>>(null);
-  const manualPauseTimesRef = useRef<number[]>([]);
   const hostFileRef = useRef<File | null>(null);
   const [guestStreamUrl, setGuestStreamUrl] = useState<string | null>(null);
   const [guestStreamMeta, setGuestStreamMeta] = useState<FileMeta | null>(null);
@@ -296,12 +295,6 @@ export function App() {
         return;
       }
 
-      // Ignore incoming snapshots for a short window after a manual action to prevent 
-      // in-flight routine updates from overriding our manual local state changes.
-      if (performance.now() - localActionLockoutRef.current < 750) {
-        return;
-      }
-
       if (remoteSnapshot.mediaId !== null && remoteSnapshot.mediaId !== currentMedia.id) {
         log(
           "warn",
@@ -317,19 +310,23 @@ export function App() {
 
       remoteApplyRef.current = true;
 
-      // Guests measure real drift: how far the local timeline lags the host's
-      // expected position (accounting for one-way latency). Hosts show latency
-      // in the meter via a dedicated effect instead, so they skip this.
+      // Guests measure real drift and apply correction.
       if (roomRef.current?.role === "guest") {
-        setDrift(readDrift(element.currentTime - targetPosition, remoteSnapshot.playbackRate));
+        const driftSecs = element.currentTime - targetPosition;
+        const reading = readDrift(driftSecs, remoteSnapshot.playbackRate);
+        setDrift(reading);
+
+        // Graduated drift correction: soft/firm nudge playbackRate, seek for large drift.
+        if (reading.mode === "seek") {
+          element.currentTime = targetPosition;
+          element.playbackRate = remoteSnapshot.playbackRate;
+        } else {
+          element.playbackRate = reading.rate;
+        }
       } else {
         setDrift(emptyDrift);
+        element.playbackRate = remoteSnapshot.playbackRate;
       }
-
-      if (Math.abs(element.currentTime - targetPosition) > 1.5) {
-        element.currentTime = targetPosition;
-      }
-      element.playbackRate = remoteSnapshot.playbackRate;
 
       if (remoteSnapshot.paused) {
         element.pause();
@@ -342,11 +339,6 @@ export function App() {
       window.setTimeout(() => {
         remoteApplyRef.current = false;
       }, 250);
-
-      // Immediately relay to other guests if we are the host
-      if (roomRef.current?.role === "host") {
-        roomRef.current.sendPlaybackState(remoteSnapshot);
-      }
     },
     [log] // stable: reads live media via mediaStateRef, not the closed-over state
   );
@@ -685,11 +677,10 @@ export function App() {
       playbackRate: element.playbackRate
     };
 
-    if (isManual) localActionLockoutRef.current = performance.now();
     setSnapshot(nextSnapshot);
 
     if (now - lastBroadcastRef.current > 250 || isManual) {
-      if (room.role === "host" || isManual) {
+      if (room.role === "host") {
         room.sendPlaybackState(nextSnapshot);
       }
       localTabChannelRef.current?.post({
@@ -701,7 +692,7 @@ export function App() {
   }, [media, room]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => publishSnapshot(false), 1500);
+    const timer = window.setInterval(() => publishSnapshot(false), 250);
     return () => window.clearInterval(timer);
   }, [publishSnapshot]);
 
@@ -748,36 +739,17 @@ export function App() {
     const element = mediaRef.current;
     if (!element) return;
 
+    // If we're applying a remote snapshot, suppress the broadcast.
     if (remoteApplyRef.current) {
-      publishSnapshot();
       return;
     }
 
-    if (room.role === "host") {
-      publishSnapshot(true);
-      return;
-    }
-
-    if (room.role === "guest") {
-      const now = Date.now();
-      manualPauseTimesRef.current = manualPauseTimesRef.current.filter(
-        (t) => now - t < 60000
-      );
-
-      if (manualPauseTimesRef.current.length >= 3) {
-        log("warn", "LIMIT", "Viewer pause limit exceeded (3 pauses per minute max). Resuming playback.");
-        void element.play().catch(() => {
-          log("error", "PLAYBACK", "Failed to override guest pause restriction.");
-        });
-      } else {
-        manualPauseTimesRef.current.push(now);
-        log("info", "PLAYBACK", `Local pause registered (${manualPauseTimesRef.current.length}/3 in last 1m).`);
-        publishSnapshot(true);
-      }
-    } else {
+    // Only the host broadcasts pause state. Guests can pause locally but the
+    // host's 250ms stream will override it — host is the single source of truth.
+    if (room.role === "host" || room.role === "solo") {
       publishSnapshot(true);
     }
-  }, [room.role, publishSnapshot, log]);
+  }, [room.role, publishSnapshot]);
 
   const handleLoadedMetadata = useCallback(async () => {
     const element = mediaRef.current;
@@ -1342,10 +1314,12 @@ export function App() {
               <Metric label="SIZE" value={formatBytes(media?.sizeBytes || 0)} />
               <Metric label="DURATION" value={formatDuration(media?.durationSecs || snapshot.duration)} />
             </div>
-            <button type="button" onClick={() => publishSnapshot(true)} style={{ marginTop: "0.6rem", width: "100%" }}>
-              <CircleDot size={14} />
-              Send Current Playback State
-            </button>
+            {room.role !== "guest" && (
+              <button type="button" onClick={() => publishSnapshot(true)} style={{ marginTop: "0.6rem", width: "100%" }}>
+                <CircleDot size={14} />
+                Send Current Playback State
+              </button>
+            )}
           </Panel>
         </aside>
 
