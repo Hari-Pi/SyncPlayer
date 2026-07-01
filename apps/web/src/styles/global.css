@@ -400,12 +400,25 @@ textarea {
   position: absolute;
 }
 
-.sync-meter__ring span {
-  font-size: 1.25rem;
-  line-height: 1;
+.sync-meter__value {
+  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  text-align: center;
 }
 
-.sync-meter__ring small {
+.sync-meter__num {
+  font-size: 1.25rem;
+  line-height: 1;
+  text-align: center;
+}
+
+.sync-meter__num--sm {
+  font-size: 0.95rem;
+}
+
+.sync-meter__value small {
   color: var(--muted);
   font-size: 0.62rem;
 }

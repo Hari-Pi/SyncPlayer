@@ -46,6 +46,33 @@ const emptyDrift: DriftReading = {
   rate: 1
 };
 
+// Drift magnitude thresholds (milliseconds). Drift is informational only —
+// no playback-rate nudge is applied; these purely drive the meter's mode/tone.
+const DRIFT_HOLD_MS = 40;
+const DRIFT_SOFT_MS = 150;
+const DRIFT_FIRM_MS = 500;
+const SOFT_RATE = 0.05;
+const FIRM_RATE = 0.1;
+
+// Compute a DriftReading from the signed offset between local currentTime and
+// the remote target position (both in seconds). Returns the recommended
+// correction multiplier relative to the host rate — it is displayed, not applied.
+function readDrift(driftSecs: number, hostRate: number): DriftReading {
+  const driftMs = driftSecs * 1000;
+  const abs = Math.abs(driftMs);
+
+  if (abs < DRIFT_HOLD_MS) {
+    return { driftMs, mode: "hold", rate: hostRate };
+  }
+  if (abs < DRIFT_SOFT_MS) {
+    return { driftMs, mode: "soft", rate: hostRate * (driftMs > 0 ? 1 - SOFT_RATE : 1 + SOFT_RATE) };
+  }
+  if (abs < DRIFT_FIRM_MS) {
+    return { driftMs, mode: "firm", rate: hostRate * (driftMs > 0 ? 1 - FIRM_RATE : 1 + FIRM_RATE) };
+  }
+  return { driftMs, mode: "seek", rate: hostRate };
+}
+
 function cx(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
 }
@@ -320,7 +347,15 @@ export function App() {
         : remoteSnapshot.position + latencyMs / 1000;
 
       remoteApplyRef.current = true;
-      setDrift({ driftMs: 0, mode: "hold", rate: 1.0 });
+
+      // Guests measure real drift: how far the local timeline lags the host's
+      // expected position (accounting for one-way latency). Hosts show latency
+      // in the meter via a dedicated effect instead, so they skip this.
+      if (roomRef.current?.role === "guest") {
+        setDrift(readDrift(element.currentTime - targetPosition, remoteSnapshot.playbackRate));
+      } else {
+        setDrift({ driftMs: 0, mode: "hold", rate: 1.0 });
+      }
 
       if (Math.abs(element.currentTime - targetPosition) > 1.5) {
         element.currentTime = targetPosition;
@@ -610,6 +645,15 @@ export function App() {
 
     return () => window.clearInterval(timer);
   }, [room]);
+
+  // Host meter: show measured peer latency (one-way, EWMA-smoothed) in the
+  // ring since the host has no upstream position to drift against. Guests
+  // populate drift in handleRemotePlayback instead.
+  useEffect(() => {
+    if (room.role === "host" && room.status === "connected") {
+      setDrift({ driftMs: room.latencyMs, mode: "hold", rate: 1 });
+    }
+  }, [room.role, room.status, room.latencyMs]);
 
   useEffect(() => {
     const channel = createLocalTabChannel((message) => {
@@ -1189,6 +1233,16 @@ export function App() {
     return "warn";
   }, [drift.mode]);
 
+  // Display drift in seconds once it crosses 1s to keep digit counts short;
+  // otherwise show whole milliseconds.
+  const { meterValue, meterUnit } = useMemo(() => {
+    const abs = Math.abs(drift.driftMs);
+    if (abs >= 1000) {
+      return { meterValue: (drift.driftMs / 1000).toFixed(2), meterUnit: "S" };
+    }
+    return { meterValue: String(Math.round(abs)), meterUnit: "MS" };
+  }, [drift.driftMs]);
+
   return (
     <main className="deck">
       <div className="scanlines" />
@@ -1330,8 +1384,10 @@ export function App() {
           <Panel title="Sync Core" icon={<Gauge size={15} />}>
             <div className="sync-meter">
               <div className="sync-meter__ring">
-                <span>{Math.round(Math.abs(drift.driftMs))}</span>
-                <small>MS</small>
+                <div className="sync-meter__value">
+                  <span className={cx("sync-meter__num", meterValue.length > 3 && "sync-meter__num--sm")}>{meterValue}</span>
+                  <small>{meterUnit}</small>
+                </div>
               </div>
               <div>
                 <span className={cx("status-pill", `status-pill--${driftTone}`)}>{drift.mode.toUpperCase()}</span>
