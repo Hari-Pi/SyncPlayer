@@ -24,6 +24,20 @@ export type FileSendProgress = {
   chunksSent: number;
   total: number;
   totalBytes: number;
+  /**
+   * True when other, already-synced viewers exist besides whoever this
+   * specific transfer targets — i.e. this is topping up a late joiner while
+   * everyone else already has the file, so it shouldn't block or pause
+   * anything for the host. False for the initial transfer, even if it
+   * happens to target only one (the first-ever) viewer.
+   */
+  background: boolean;
+};
+
+/** Per-viewer receive progress, keyed by peer ID, for the host-side "who has how much" view. */
+export type PeerFileProgress = {
+  chunksReceived: number;
+  total: number;
 };
 
 export type FileReceiveProgress = {
@@ -284,6 +298,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const [connectedPeers, setConnectedPeers] = useState<string[]>([]);
   const [fileSendProgress, setFileSendProgress] = useState<FileSendProgress | null>(null);
   const [fileReceiveProgress, setFileReceiveProgress] = useState<FileReceiveProgress | null>(null);
+  // Host-side: each connected viewer's own reported receive progress, keyed by peer ID.
+  const [peerFileProgress, setPeerFileProgress] = useState<Record<string, PeerFileProgress>>({});
 
   const peerId = useMemo(() => `SP-${genRoomCode()}`, []);
 
@@ -352,6 +368,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     setLocalOffer("");
     setFileSendProgress(null);
     setFileReceiveProgress(null);
+    setPeerFileProgress({});
     fileStreamHandlersRef.current.clear();
     peerHealthRef.current.clear();
     guestActionHistoryRef.current.clear();
@@ -551,8 +568,12 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       }
 
       if (message.type === "file.progress") {
+        // Track this specific peer's own progress rather than clobbering a
+        // single shared counter — with multiple viewers, whichever peer's
+        // echo arrived most recently would otherwise overwrite the others'.
         const { chunksReceived, total } = message.payload;
-        setFileSendProgress((prev) => prev ? { ...prev, chunksSent: chunksReceived, total } : prev);
+        const peerKey = conn.peer;
+        setPeerFileProgress((prev) => ({ ...prev, [peerKey]: { chunksReceived, total } }));
         return;
       }
 
@@ -697,9 +718,17 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
    * Stream a File to a specific connection (or all connections).
    * Uses a Web Worker to read + hash chunks off the main thread.
    * Applies per-connection flow control via bufferedAmount watermarks.
+   *
+   * `background` controls whether this counts as a "quiet" transfer for
+   * FileSendProgress.background (see that type) — the caller decides this,
+   * since only it knows whether other already-synced viewers exist. It does
+   * NOT default from whether targetPeerIds was passed: a late joiner who
+   * happens to be the very first viewer ever is still an "initial" transfer,
+   * not a background one, even though it's targeted at just that one peer.
    */
   const sendFile = useCallback(
-    async (file: File, mediaId: string, targetPeerIds?: string[]) => {
+    async (file: File, mediaId: string, options?: { targetPeerIds?: string[]; background?: boolean }) => {
+      const { targetPeerIds, background = false } = options ?? {};
       const conns = targetPeerIds
         ? connectionsRef.current.filter(c => targetPeerIds.includes(c.peer))
         : connectionsRef.current;
@@ -710,11 +739,34 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       const generation = ++activeSendGenerationRef.current;
       const isCurrent = () => activeSendGenerationRef.current === generation;
 
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+      // Set this before any `await` — the caller (e.g. handleLocalFile) sets
+      // its own media/UI state and then fires this off in the same tick, so
+      // if this update lands even one microtask later (as it would after an
+      // `await import(...)`), the player can render for a frame before the
+      // upload lock catches up. Doing it first keeps both state updates in
+      // the same React batch.
+      setFileSendProgress({
+        mediaId,
+        fileName: file.name,
+        chunksSent: 0,
+        total: totalChunks,
+        totalBytes: file.size,
+        background
+      });
+      setPeerFileProgress((prev) => {
+        const next = { ...prev };
+        for (const conn of conns) {
+          next[conn.peer] = { chunksReceived: 0, total: totalChunks };
+        }
+        return next;
+      });
+
       const mimeType = file.type || "video/mp4";
       const { inferMediaFormat } = await import("@/lib/media/mediaTypes");
       const format = inferMediaFormat(mimeType);
 
-      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
       const meta: FileMeta = {
         mediaId,
         fileName: file.name,
@@ -724,8 +776,6 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         isBlob: true,
         totalChunks
       };
-
-      setFileSendProgress({ mediaId, fileName: file.name, chunksSent: 0, total: totalChunks, totalBytes: file.size });
 
       // Group connections by peer ID for multiplexing
       const peerConns = new Map<string, DataConnection[]>();
@@ -993,6 +1043,12 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
           guestActionHistoryRef.current.delete(conn.peer);
           resumeInfoRef.current.delete(conn.peer);
           resumeWaitersRef.current.delete(conn.peer);
+          setPeerFileProgress((prev) => {
+            if (!(conn.peer in prev)) return prev;
+            const next = { ...prev };
+            delete next[conn.peer];
+            return next;
+          });
         }
         if (connectionsRef.current.length === 0) {
           setStatus("disconnected");
@@ -1159,6 +1215,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     connectedPeers,
     fileSendProgress,
     fileReceiveProgress,
+    peerFileProgress,
     createHostOffer,
     joinWithOffer,
     closeRoom,

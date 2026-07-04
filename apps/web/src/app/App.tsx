@@ -860,7 +860,7 @@ export function App() {
   // see isUploadLocked — so there's nothing to resume until it finishes.
   const wasUploadingRef = useRef(false);
   useEffect(() => {
-    const isUploading = room.role === "host" && !!room.fileSendProgress;
+    const isUploading = room.role === "host" && !!room.fileSendProgress && !room.fileSendProgress.background;
     if (isUploading && !wasUploadingRef.current) {
       mediaRef.current?.pause();
     }
@@ -1142,8 +1142,18 @@ export function App() {
 
     const currentMedia = mediaStateRef.current;
     if (newPeers.length > 0 && room.role === "host" && hostFileRef.current && currentMedia?.origin === "local-file") {
-      log("info", "FILE", `New peer(s) connected: ${newPeers.join(", ")}. Streaming local file to them...`);
-      void room.sendFile(hostFileRef.current, currentMedia.id, newPeers);
+      // If every currently-connected peer is brand new, nobody has this file
+      // yet — that's still an initial transfer (locks the host), even though
+      // it's targeted at specific peer IDs. It's only a quiet background
+      // top-up when some OTHER, already-connected peer isn't part of this
+      // batch — meaning they already have it and are watching.
+      const isInitialDelivery = curr.length === newPeers.length;
+      log(
+        "info",
+        "FILE",
+        `New peer(s) connected: ${newPeers.join(", ")}. Streaming local file to them${isInitialDelivery ? "" : " in the background"}...`
+      );
+      void room.sendFile(hostFileRef.current, currentMedia.id, { targetPeerIds: newPeers, background: !isInitialDelivery });
       return;
     }
 
@@ -1533,11 +1543,20 @@ export function App() {
   const statusTone = room.status === "connected" ? "ok" : room.status === "failed" ? "warn" : "normal";
   const mediaIcon = media?.kind === "audio" ? <AudioLines size={17} /> : <FileVideo size={17} />;
 
-  // While the host is actively streaming a local file to viewers, lock the
-  // player surface and show upload progress instead — keeps the host from
-  // getting a head start on playback (or drifting into a big correction)
-  // while viewers are still receiving the file.
-  const isUploadLocked = room.role === "host" && !!room.fileSendProgress;
+  // While the host is actively streaming a local file to EVERYONE currently
+  // connected, lock the player surface and show upload progress instead —
+  // keeps the host from getting a head start on playback while viewers are
+  // still receiving the file. A late joiner gets the file sent to them alone
+  // in the background (see the late-join effect below) — that shouldn't
+  // pause or lock anything, since other viewers are already watching in sync.
+  const isUploadLocked = room.role === "host" && !!room.fileSendProgress && !room.fileSendProgress.background;
+
+  // Viewers don't pick their own media — the host mounts it (or streams the
+  // local file) and it gets pushed to them. Selecting a local file or URL as
+  // a guest would just desync you from the host, so lock those controls for
+  // the whole time you're a guest, not just mid-upload.
+  const isGuestControlled = room.role === "guest";
+  const mediaSelectionLocked = isUploadLocked || isGuestControlled;
 
   const driftTone = useMemo(() => {
     if (drift.mode === "hold" || drift.mode === "soft") {
@@ -1615,7 +1634,13 @@ export function App() {
           </div>
           <div className="status-band__actions">
             {room.role === "host" && (
-              <button type="button" className="status-band__btn" onClick={() => publishSnapshot(true)}>
+              <button
+                type="button"
+                className="status-band__btn"
+                onClick={() => publishSnapshot(true)}
+                disabled={isUploadLocked}
+                title={isUploadLocked ? "Locked while uploading to viewers" : undefined}
+              >
                 Force Sync State
               </button>
             )}
@@ -1723,7 +1748,13 @@ export function App() {
               <Metric label="DURATION" value={formatDuration(media?.durationSecs || snapshot.duration)} />
             </div>
             {room.role !== "guest" && (
-              <button type="button" onClick={() => publishSnapshot(true)} style={{ marginTop: "0.6rem", width: "100%" }}>
+              <button
+                type="button"
+                onClick={() => publishSnapshot(true)}
+                style={{ marginTop: "0.6rem", width: "100%" }}
+                disabled={isUploadLocked}
+                title={isUploadLocked ? "Locked while uploading to viewers" : undefined}
+              >
                 <CircleDot size={14} />
                 Send Current Playback State
               </button>
@@ -1733,10 +1764,13 @@ export function App() {
 
         <section className="main-stage">
           <div className="control-strip">
-            <label className={cx("file-button", isUploadLocked && "file-button--disabled")}>
+            <label
+              className={cx("file-button", mediaSelectionLocked && "file-button--disabled")}
+              title={isGuestControlled ? "Media is controlled by the host" : undefined}
+            >
               <Upload size={16} />
               Select File
-              <input accept="audio/*,video/*" type="file" onChange={handleLocalFile} disabled={isUploadLocked} />
+              <input accept="audio/*,video/*" type="file" onChange={handleLocalFile} disabled={mediaSelectionLocked} />
             </label>
             <div className="url-loader">
               <Link2 size={16} />
@@ -1748,11 +1782,17 @@ export function App() {
                     void handleRemoteUrl();
                   }
                 }}
-                placeholder="Paste MP4, MP3, M3U8, MPD, WebM..."
+                placeholder={isGuestControlled ? "Media is controlled by the host" : "Paste MP4, MP3, M3U8, MPD, WebM..."}
                 aria-label="Remote media URL, including MP4, WebM, M3U8, MPD, MP3, WAV, or OGG"
-                disabled={isUploadLocked}
+                disabled={mediaSelectionLocked}
+                title={isGuestControlled ? "Media is controlled by the host" : undefined}
               />
-              <button type="button" onClick={handleRemoteUrl} disabled={isUploadLocked}>
+              <button
+                type="button"
+                onClick={handleRemoteUrl}
+                disabled={mediaSelectionLocked}
+                title={isGuestControlled ? "Media is controlled by the host" : undefined}
+              >
                 <Send size={15} />
                 Load URL
               </button>
@@ -1806,23 +1846,40 @@ export function App() {
 
               {/* Host controls are locked and the player is covered while a
                   local file streams to viewers, so nobody gets a head start
-                  on watching before everyone actually has the file. */}
+                  on watching before everyone actually has the file. Shows
+                  each connected viewer's own progress rather than one vague
+                  aggregate number. */}
               {isUploadLocked && room.fileSendProgress && (
                 <div className="upload-lock-overlay">
-                  <Lock size={40} />
+                  <Lock size={36} />
                   <strong>Uploading to viewers</strong>
                   <span>
-                    Playback is locked until "{room.fileSendProgress.fileName}" finishes sending to{" "}
-                    {room.connectedPeers.length} viewer{room.connectedPeers.length === 1 ? "" : "s"}.
+                    Playback is locked until "{room.fileSendProgress.fileName}" ({formatBytes(room.fileSendProgress.totalBytes)}) finishes
+                    sending to {room.connectedPeers.length} viewer{room.connectedPeers.length === 1 ? "" : "s"}.
                   </span>
-                  <FileProgressBar
-                    label="Sending"
-                    fileName={room.fileSendProgress.fileName}
-                    chunksDone={room.fileSendProgress.chunksSent}
-                    total={room.fileSendProgress.total}
-                    totalBytes={room.fileSendProgress.totalBytes}
-                    style={{ width: "min(28rem, 100%)" }}
-                  />
+                  <div className="upload-lock-viewers">
+                    {room.connectedPeers.length === 0 ? (
+                      <span className="upload-lock-viewers__empty">No viewers connected yet.</span>
+                    ) : (
+                      room.connectedPeers.map((peer, idx) => {
+                        const progress = room.peerFileProgress[peer];
+                        const total = progress?.total ?? room.fileSendProgress?.total ?? 0;
+                        const chunksReceived = progress?.chunksReceived ?? 0;
+                        const percent = total > 0 ? Math.round((chunksReceived / total) * 100) : 0;
+                        const label = peer.startsWith("SP-GUEST") ? `Viewer (${peer.slice(9)})` : `Peer ${idx + 1}`;
+
+                        return (
+                          <div className="upload-lock-viewer-row" key={peer}>
+                            <span className="upload-lock-viewer-row__label">{label}</span>
+                            <div className="upload-lock-viewer-row__bar">
+                              <div className="upload-lock-viewer-row__fill" style={{ width: `${percent}%` }} />
+                            </div>
+                            <span className="upload-lock-viewer-row__percent">{percent}%</span>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -1925,10 +1982,11 @@ export function App() {
               </div>
             )}
 
-            {/* Host send progress bar */}
+            {/* Host send progress bar. Background sends (late joiners) get a
+                distinct label since they're not blocking anything. */}
             {room.fileSendProgress && (
               <FileProgressBar
-                label="Streaming to peers"
+                label={room.fileSendProgress.background ? "Sending to new viewer" : "Streaming to peers"}
                 fileName={room.fileSendProgress.fileName}
                 chunksDone={room.fileSendProgress.chunksSent}
                 total={room.fileSendProgress.total}

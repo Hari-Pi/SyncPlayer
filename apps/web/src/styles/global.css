@@ -542,6 +542,57 @@ textarea {
   max-width: 32rem;
 }
 
+.upload-lock-viewers {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.4rem;
+  max-height: 12rem;
+  overflow-y: auto;
+  width: min(28rem, 100%);
+}
+
+.upload-lock-viewer-row {
+  align-items: center;
+  background: rgba(55, 243, 255, 0.03);
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  display: grid;
+  gap: 0.6rem;
+  grid-template-columns: minmax(5rem, auto) 1fr 2.6rem;
+  padding: 0.4rem 0.6rem;
+}
+
+.upload-lock-viewers .upload-lock-viewer-row__label {
+  color: var(--text);
+  font-size: 0.7rem;
+  max-width: none;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.upload-lock-viewer-row__bar {
+  background: rgba(55, 243, 255, 0.1);
+  border-radius: 2px;
+  height: 5px;
+  overflow: hidden;
+  width: 100%;
+}
+
+.upload-lock-viewer-row__fill {
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  height: 100%;
+  transition: width 200ms ease;
+}
+
+.upload-lock-viewers .upload-lock-viewer-row__percent {
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 700;
+  max-width: none;
+  text-align: right;
+}
+
 .control-strip {
   align-items: center;
   background: var(--panel-strong);
