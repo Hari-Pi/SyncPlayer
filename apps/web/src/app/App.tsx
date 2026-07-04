@@ -73,6 +73,13 @@ const SEEK_COOLDOWN_MS = 1500;
 // (e.g. a late/jittery message) doesn't trigger an aggressive correction.
 const DRIFT_SMOOTHING_SAMPLES = 3;
 
+// How close a "seeked" event's resulting position has to be to our last
+// programmatic drift-correction target to count as that correction settling
+// (rather than a new user seek), and how long that tracked target stays
+// valid before we stop trusting it as an explanation for a later event.
+const PROGRAMMATIC_SEEK_MATCH_TOLERANCE_SECS = 0.75;
+const PROGRAMMATIC_SEEK_MAX_AGE_MS = 5000;
+
 // Viewers can pause/seek and reverse-sync that to the host; the two share one
 // budget per rolling window so a viewer can't spam controls and annoy the
 // rest of the room. Resume is exempt (see handlePlaybackAction). The host
@@ -338,6 +345,15 @@ export function App() {
   const lastSeekAtRef = useRef(0);
   // True while the local media element is stalled waiting for data.
   const isStalledRef = useRef(false);
+  // Guest-side: the position we last programmatically seeked to for drift
+  // correction, and when. The browser's own "seeked" event for that seek can
+  // fire well after our fixed remoteApplyRef window closes — especially
+  // during buffering, which is exactly when drift correction tends to fire —
+  // so a delayed "seeked" from our OWN correction can slip past the timing
+  // guard and get misread as a user-initiated seek. Matching the resulting
+  // position against this tracked target (rather than relying on elapsed
+  // time) disambiguates correctly regardless of how long the seek took.
+  const lastProgrammaticSeekRef = useRef<{ target: number; setAt: number } | null>(null);
   // Guest-side: rolling timestamps of accepted control actions (pause/resume/seek
   // share one budget), used for the client-side rate-limit gate.
   const guestActionHistoryRef = useRef<number[]>([]);
@@ -450,6 +466,7 @@ export function App() {
             element.currentTime = targetPosition;
             element.playbackRate = remoteSnapshot.playbackRate;
             lastSeekAtRef.current = now;
+            lastProgrammaticSeekRef.current = { target: targetPosition, setAt: now };
             driftHistoryRef.current = [];
           }
         } else {
@@ -501,7 +518,25 @@ export function App() {
   // starting over, and tell the host which chunks to skip re-sending.
   const handleFileStream = useCallback((meta: FileMeta): FileStreamHandlers => {
     const existing = activeFileWriteRef.current;
-    const isResume = !!existing && existing.mediaId === meta.mediaId && !existing.finalized && !existing.aborted;
+    const isSameMedia = !!existing && existing.mediaId === meta.mediaId && !existing.aborted;
+
+    // We already have the whole file and it's mounted (e.g. a redundant
+    // late-join re-send, or reconnecting shortly after finishing). Don't
+    // wipe a completed download and restart from zero — just tell the host
+    // we have everything and leave our existing state alone.
+    if (isSameMedia && existing!.finalized) {
+      const write = existing!;
+      log("info", "FILE", `Already have "${meta.fileName}" complete — telling the host to skip re-sending it.`);
+      roomRef.current?.sendFileResume(meta.mediaId, [[0, write.totalChunks - 1]]);
+      return {
+        alreadyReceivedCount: write.totalChunks,
+        onChunk: () => { /* host shouldn't send anything, but ignore harmlessly if it does */ },
+        onEnd: () => { /* already finalized */ },
+        onAbort: () => { /* nothing in flight to abort */ }
+      };
+    }
+
+    const isResume = isSameMedia && !existing!.finalized;
 
     let write: ActiveFileWrite;
 
@@ -640,6 +675,16 @@ export function App() {
         } else {
           write.endReceived = true;
         }
+      },
+      onAbort: (reason) => {
+        if (write.aborted || write.finalized) return;
+        write.aborted = true;
+        setGuestStreamMeta(null);
+        log(
+          "error",
+          "FILE",
+          `Transfer of "${write.fileName}" aborted by host${reason ? `: ${reason}` : "."} You'll need to wait for the host to retry.`
+        );
       }
     };
   }, [cleanupOpfsFile, log]);
@@ -661,6 +706,7 @@ export function App() {
       driftHistoryRef.current = [];
       lastSeekAtRef.current = 0;
       isStalledRef.current = false;
+      lastProgrammaticSeekRef.current = null;
       hostFileRef.current = null;
       log("ok", "MEDIA", source === "invite" ? "Media URL loaded from invite link." : `${mediaFormatLabel(nextMedia.format)} URL mounted.`);
       return nextMedia;
@@ -682,6 +728,7 @@ export function App() {
     driftHistoryRef.current = [];
     lastSeekAtRef.current = 0;
     isStalledRef.current = false;
+    lastProgrammaticSeekRef.current = null;
     log("ok", "MEDIA", `${nextMedia.title} mounted from host.`);
   }, [cleanupOpfsFile, log]);
 
@@ -1102,7 +1149,26 @@ export function App() {
 
   const handlePause = useCallback(() => handlePlaybackAction("pause"), [handlePlaybackAction]);
   const handleResume = useCallback(() => handlePlaybackAction("resume"), [handlePlaybackAction]);
-  const handleSeeked = useCallback(() => handlePlaybackAction("seek"), [handlePlaybackAction]);
+
+  const handleSeeked = useCallback(() => {
+    const element = mediaRef.current;
+    const pending = lastProgrammaticSeekRef.current;
+
+    if (
+      element &&
+      pending &&
+      performance.now() - pending.setAt < PROGRAMMATIC_SEEK_MAX_AGE_MS &&
+      Math.abs(element.currentTime - pending.target) < PROGRAMMATIC_SEEK_MATCH_TOLERANCE_SECS
+    ) {
+      // This "seeked" event is our own drift correction settling late (it can
+      // take a while if the seek needed to buffer), not a new user seek —
+      // consume the tracked target and don't forward it as a guest action.
+      lastProgrammaticSeekRef.current = null;
+      return;
+    }
+
+    handlePlaybackAction("seek");
+  }, [handlePlaybackAction]);
 
   const handleLoadedMetadata = useCallback(async () => {
     const element = mediaRef.current;
@@ -1144,6 +1210,7 @@ export function App() {
       driftHistoryRef.current = [];
       lastSeekAtRef.current = 0;
       isStalledRef.current = false;
+      lastProgrammaticSeekRef.current = null;
       log("ok", "MEDIA", `${file.name} mounted as local source.`);
 
       // If already hosting a connected room, stream immediately to all peers

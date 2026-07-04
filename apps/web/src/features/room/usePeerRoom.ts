@@ -21,6 +21,8 @@ export type FileStreamHandlers = {
   onProgress?: (chunksReceived: number, total: number) => void;
   /** If this file.meta is a resume of a partially-received transfer, how many chunks we already have. */
   alreadyReceivedCount?: number;
+  /** The host aborted this transfer (e.g. an internal error) — stop waiting and clean up. */
+  onAbort?: (reason?: string) => void;
 };
 
 export type FileSendProgress = {
@@ -381,9 +383,13 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const resumeInfoRef = useRef<Map<string, { mediaId: string; ranges: Array<[number, number]> }>>(new Map());
   // Host-side: one-shot resolvers waiting on a specific peer's next "file.resume" reply.
   const resumeWaitersRef = useRef<Map<string, (ranges: Array<[number, number]> | null) => void>>(new Map());
-  // Guards against two overlapping sendFile() calls fighting over the same
-  // connections (e.g. host swaps files while a previous transfer is still draining).
-  const activeSendGenerationRef = useRef(0);
+  // Guards against two sendFile() calls fighting over the SAME peer's
+  // connections (e.g. host swaps files while a previous transfer to that
+  // peer is still draining). Scoped per-peer rather than one global counter —
+  // a background transfer to a late-joining peer must NOT cancel an
+  // unrelated, still-in-progress transfer to completely different peers.
+  const peerTransferStateRef = useRef<Map<string, { generation: number; mediaId: string }>>(new Map());
+  const sendGenerationCounterRef = useRef(0);
 
   // Host-side connection-approval bookkeeping (see peer.on("connection") below).
   // Channels awaiting a decision, grouped by peer ID — a guest opens several
@@ -424,7 +430,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     guestActionHistoryRef.current.clear();
     resumeInfoRef.current.clear();
     resumeWaitersRef.current.clear();
-    activeSendGenerationRef.current += 1;
+    peerTransferStateRef.current.clear();
     pendingConnectionsRef.current.clear();
     peerDecisionRef.current.clear();
     pendingTimeoutsRef.current.forEach((timeout) => window.clearTimeout(timeout));
@@ -642,9 +648,35 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         // Track this specific peer's own progress rather than clobbering a
         // single shared counter — with multiple viewers, whichever peer's
         // echo arrived most recently would otherwise overwrite the others'.
-        const { chunksReceived, total } = message.payload;
         const peerKey = conn.peer;
+
+        // Guard against a stale echo from a transfer that's since been
+        // superseded or has already finished for this peer — otherwise a
+        // late-arriving message from an old/canceled transfer could stomp
+        // this peer's progress with numbers for the wrong file.
+        const active = peerTransferStateRef.current.get(peerKey);
+        if (!active || active.mediaId !== message.payload.mediaId) {
+          return;
+        }
+
+        const { chunksReceived, total } = message.payload;
         setPeerFileProgress((prev) => ({ ...prev, [peerKey]: { chunksReceived, total } }));
+        return;
+      }
+
+      if (message.type === "file.aborted") {
+        // Guest-side: the host's send pipeline died mid-transfer. Let the
+        // in-progress receive handlers clean up instead of sitting at
+        // "Receiving..." forever with no explanation.
+        const handlers = fileStreamHandlersRef.current.get(message.payload.mediaId);
+        handlers?.onAbort?.(message.payload.reason);
+        fileStreamHandlersRef.current.delete(message.payload.mediaId);
+        setFileReceiveProgress((prev) => (prev?.mediaId === message.payload.mediaId ? null : prev));
+        onEventRef.current(
+          "error",
+          "FILE",
+          `Host aborted the file transfer${message.payload.reason ? `: ${message.payload.reason}` : "."}`
+        );
         return;
       }
 
@@ -805,10 +837,16 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         : connectionsRef.current;
       if (conns.length === 0) return;
 
-      // Cancel any previous in-flight transfer instead of letting two run
-      // concurrently and fight over the same connections' flow control.
-      const generation = ++activeSendGenerationRef.current;
-      const isCurrent = () => activeSendGenerationRef.current === generation;
+      // Cancel a previous transfer only if it's actually fighting over the
+      // SAME peer's connections — scoped per-peer rather than one global
+      // counter. Otherwise a background transfer to a late-joining peer
+      // would wrongly cancel an unrelated, still-in-progress transfer to
+      // completely different peers.
+      const generation = ++sendGenerationCounterRef.current;
+      const targetPeerIdSet = Array.from(new Set(conns.map((c) => c.peer)));
+      targetPeerIdSet.forEach((peerId) => peerTransferStateRef.current.set(peerId, { generation, mediaId }));
+      const isCurrent = () =>
+        targetPeerIdSet.every((peerId) => peerTransferStateRef.current.get(peerId)?.generation === generation);
 
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
@@ -890,6 +928,13 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
             peerSkipRanges.set(peerId, ranges);
             const alreadyHave = ranges.reduce((sum, [start, end]) => sum + (end - start + 1), 0);
             onEventRef.current("ok", "FILE", `${peerId}: resuming transfer — already has ${alreadyHave}/${totalChunks} chunks, skipping those.`);
+
+            if (alreadyHave >= totalChunks) {
+              // Every chunk gets skipped for this peer — nothing will ever be
+              // sent or echoed back for them, so reflect completion now
+              // instead of leaving their progress stuck at 0%.
+              setPeerFileProgress((prev) => ({ ...prev, [peerId]: { chunksReceived: totalChunks, total: totalChunks } }));
+            }
           }
         })
       );
@@ -913,6 +958,24 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       let workersActive = 0;
       let workersDone = 0;
       let workerError: string | null = null;
+
+      // All workers created below, so a failure can terminate every one of
+      // them instead of leaving survivors running in the background against
+      // a transfer everyone else has already given up on.
+      const workers: Worker[] = [];
+      const terminateAllWorkers = () => {
+        workers.forEach((w) => w.terminate());
+      };
+
+      // Best-effort: let every targeted peer know this transfer died, so a
+      // guest mid-download doesn't sit at "Receiving..." forever with no
+      // explanation once the sender side has actually given up.
+      const notifyPeersAborted = (reason?: string) => {
+        for (const [, connections] of peerConns.entries()) {
+          const firstOpen = connections.find((c) => c.open);
+          if (firstOpen) sendToOne(firstOpen, "file.aborted", { mediaId, reason });
+        }
+      };
 
       await new Promise<void>((resolve, reject) => {
         const rejectTransfer = (error: unknown) => reject(error);
@@ -1005,6 +1068,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
             new URL("../../workers/fileWorker.ts", import.meta.url),
             { type: "module" }
           );
+          workers.push(worker);
 
           worker.onmessage = (event: MessageEvent) => {
             if (!isCurrent()) {
@@ -1016,6 +1080,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
             if (msg.type === "ready") return;
             if (msg.type === "error") {
               workerError = msg.error as string;
+              terminateAllWorkers();
+              notifyPeersAborted(workerError);
               reject(new Error(workerError));
               return;
             }
@@ -1038,7 +1104,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
             }
           };
 
-          worker.onerror = (err) => reject(new Error(err.message));
+          worker.onerror = (err) => {
+            terminateAllWorkers();
+            notifyPeersAborted(err.message);
+            reject(new Error(err.message));
+          };
 
           worker.postMessage({
             type: "start",
@@ -1056,7 +1126,13 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         }
       });
 
-      if (isCurrent() && !workerError && workersDone === workersActive) {
+      // Clear the lock unconditionally once this transfer settles — on
+      // success or failure alike. Previously this only ran on the success
+      // path, so a worker failure left fileSendProgress (and therefore the
+      // host's upload lock) stuck forever. If a newer transfer has already
+      // superseded this one, `isCurrent()` is false and we correctly leave
+      // its state alone instead of clobbering it.
+      if (isCurrent()) {
         setFileSendProgress(null);
       }
     },
@@ -1216,6 +1292,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
           resumeInfoRef.current.delete(conn.peer);
           resumeWaitersRef.current.delete(conn.peer);
           peerDecisionRef.current.delete(conn.peer);
+          peerTransferStateRef.current.delete(conn.peer);
           setPeerFileProgress((prev) => {
             if (!(conn.peer in prev)) return prev;
             const next = { ...prev };

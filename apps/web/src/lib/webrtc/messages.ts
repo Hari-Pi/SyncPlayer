@@ -123,6 +123,15 @@ export type WireMessage =
     }
   | {
       id: string;
+      type: "file.aborted";
+      sentAt: number;
+      payload: {
+        mediaId: string;
+        reason?: string;
+      };
+    }
+  | {
+      id: string;
       type: "config.request";
       sentAt: number;
       payload: Record<string, never>;
