@@ -95,6 +95,16 @@ export type WireMessage =
     }
   | {
       id: string;
+      type: "file.resume";
+      sentAt: number;
+      payload: {
+        mediaId: string;
+        /** Sorted, non-overlapping inclusive [start, end] chunk-index ranges already received. Empty for a fresh transfer. */
+        receivedRanges: Array<[number, number]>;
+      };
+    }
+  | {
+      id: string;
       type: "file.progress";
       sentAt: number;
       payload: {
@@ -131,4 +141,16 @@ export type WireMessage =
         /** seconds of buffered media ahead of the reporting peer's current playback position. */
         bufferedAheadSecs: number;
       };
+    }
+  | {
+      id: string;
+      type: "playback.guestAction";
+      sentAt: number;
+      payload: {
+        /** A viewer-initiated control action, reverse-synced to the host (rate-limited). */
+        action: "pause" | "resume" | "seek";
+        snapshot: PlaybackSnapshot;
+      };
     };
+
+export type GuestPlaybackAction = "pause" | "resume" | "seek";

@@ -6,35 +6,7 @@
  * and posts each chunk back so the main thread can forward it over the P2P data channel.
  */
 
-// FNV-1a 64-bit — pure JS, no imports needed in the worker context
-function fnv1aHash(data: Uint8Array): string {
-  const FNV_OFFSET = 14695981039346656037n;
-  const FNV_PRIME = 1099511628211n;
-  const MASK = 0xFFFFFFFFFFFFFFFFn;
-  let hash = FNV_OFFSET;
-  for (const byte of data) {
-    hash = (hash ^ BigInt(byte)) & MASK;
-    hash = (hash * FNV_PRIME) & MASK;
-  }
-  return hash.toString(16).padStart(16, "0");
-}
-
-function chunkChecksum(index: number, data: Uint8Array): string {
-  const FNV_OFFSET = 14695981039346656037n;
-  const FNV_PRIME = 1099511628211n;
-  const MASK = 0xFFFFFFFFFFFFFFFFn;
-  let hash = FNV_OFFSET;
-  const indexBytes = new Uint8Array(new Uint32Array([index]).buffer);
-  for (const byte of indexBytes) {
-    hash = (hash ^ BigInt(byte)) & MASK;
-    hash = (hash * FNV_PRIME) & MASK;
-  }
-  for (const byte of data) {
-    hash = (hash ^ BigInt(byte)) & MASK;
-    hash = (hash * FNV_PRIME) & MASK;
-  }
-  return hash.toString(16).padStart(16, "0");
-}
+import { chunkChecksum } from "@/lib/media/checksum";
 
 type WorkerInMessage =
   | { type: "start"; file: File; mediaId: string; chunkSize: number; startChunkIndex: number; endChunkIndex: number; totalChunks: number }

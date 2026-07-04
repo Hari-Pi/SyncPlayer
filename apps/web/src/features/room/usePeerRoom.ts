@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Peer, DataConnection, type PeerJSOption } from "peerjs";
-import type { PlaybackSnapshot, WireMessage, FileMeta, RemoteMediaMount, PlaybackConfig } from "@/lib/webrtc/messages";
+import type { PlaybackSnapshot, WireMessage, FileMeta, RemoteMediaMount, PlaybackConfig, GuestPlaybackAction } from "@/lib/webrtc/messages";
 import { CHUNK_SIZE } from "@/lib/webrtc/messages";
 import { smoothLatencySync } from "@/lib/wasm/syncCore";
+import { combineChecksums, rangesInclude } from "@/lib/media/checksum";
 
 type RoomRole = "solo" | "host" | "guest";
 type LinkStatus = "idle" | "pairing" | "connected" | "disconnected" | "failed";
@@ -13,6 +14,8 @@ export type FileStreamHandlers = {
   onChunk: (index: number, total: number, data: Uint8Array, checksum: string) => void;
   onEnd: (checksum: string) => void;
   onProgress?: (chunksReceived: number, total: number) => void;
+  /** If this file.meta is a resume of a partially-received transfer, how many chunks we already have. */
+  alreadyReceivedCount?: number;
 };
 
 export type FileSendProgress = {
@@ -39,6 +42,8 @@ type PeerRoomOptions = {
   onConfigRequest?: (conn: DataConnection) => void;
   onConfigState?: (config: PlaybackConfig) => void;
   onConfigChanged?: () => void;
+  /** Host-side: a viewer performed a rate-limited pause/resume/seek and it passed the host's own limit check. */
+  onGuestAction?: (action: GuestPlaybackAction, snapshot: PlaybackSnapshot, peerId: string) => void;
 };
 
 function readStoredPeerOptions() {
@@ -219,6 +224,26 @@ type PeerHealthState = {
   healthyStreak: number;
 };
 
+// ─── Guest control rate limiting ──────────────────────────────────────────────
+// Viewers can pause/seek and have it reverse-sync to the host; pause and seek
+// share one budget so a viewer can't spam controls to annoy the room. Resume
+// is exempt (see below) so pausing never leaves a guest stuck. Enforced
+// host-side (authoritative) in addition to whatever client-side gate the
+// sender applies, since the sender's own check can't be trusted on its own.
+const GUEST_ACTION_LIMIT = 3;
+const GUEST_ACTION_WINDOW_MS = 60_000;
+
+// ─── File transfer tuning ──────────────────────────────────────────────────────
+// How long a fresh file.meta send waits for a peer's "file.resume" reply
+// before assuming it has nothing to resume and streaming from the start.
+// Guests always reply promptly (even with empty ranges), so this is really
+// just a worst-case fallback, not the expected wait in practice.
+const RESUME_ACK_TIMEOUT_MS = 500;
+// How often (ms) a receiving peer echoes cumulative chunk progress back to
+// the sender. Echoing on every 64KB chunk floods the channel; this throttles
+// it to a cadence that's still responsive enough for a progress bar.
+const PROGRESS_ECHO_INTERVAL_MS = 250;
+
 function getDataChannel(conn: DataConnection) {
   return conn.dataChannel ?? (conn as unknown as { _dc?: RTCDataChannel })._dc ?? null;
 }
@@ -250,7 +275,7 @@ function genRoomCode(): string {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
-export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged }: PeerRoomOptions) {
+export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged, onGuestAction }: PeerRoomOptions) {
   const [role, setRole] = useState<RoomRole>("solo");
   const [status, setStatus] = useState<LinkStatus>("idle");
   const [localOffer, setLocalOffer] = useState("");
@@ -271,6 +296,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const onConfigRequestRef = useRef(onConfigRequest);
   const onConfigStateRef = useRef(onConfigState);
   const onConfigChangedRef = useRef(onConfigChanged);
+  const onGuestActionRef = useRef(onGuestAction);
   useEffect(() => {
     onPlaybackStateRef.current = onPlaybackState;
     onEventRef.current = onEvent;
@@ -279,7 +305,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     onConfigRequestRef.current = onConfigRequest;
     onConfigStateRef.current = onConfigState;
     onConfigChangedRef.current = onConfigChanged;
-  }, [onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged]);
+    onGuestActionRef.current = onGuestAction;
+  }, [onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged, onGuestAction]);
 
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<DataConnection[]>([]);
@@ -289,8 +316,20 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const rttSamplesRef = useRef<number[]>([]);
   // Active FileStreamHandlers keyed by mediaId (guest side)
   const fileStreamHandlersRef = useRef<Map<string, FileStreamHandlers>>(new Map());
+  // Guest-side: last time we echoed receive progress back to the sender, keyed by mediaId.
+  const lastProgressEchoAtRef = useRef<Map<string, number>>(new Map());
   // Host-side: per-guest-peer adaptive broadcast cadence state, keyed by conn.peer.
   const peerHealthRef = useRef<Map<string, PeerHealthState>>(new Map());
+  // Host-side: per-guest-peer rolling timestamps of accepted control actions, keyed by conn.peer.
+  const guestActionHistoryRef = useRef<Map<string, number[]>>(new Map());
+  // Host-side: latest "file.resume" info received per peer, keyed by conn.peer.
+  // Populated whenever a resume reply arrives, consumed by sendFile's wait step.
+  const resumeInfoRef = useRef<Map<string, { mediaId: string; ranges: Array<[number, number]> }>>(new Map());
+  // Host-side: one-shot resolvers waiting on a specific peer's next "file.resume" reply.
+  const resumeWaitersRef = useRef<Map<string, (ranges: Array<[number, number]> | null) => void>>(new Map());
+  // Guards against two overlapping sendFile() calls fighting over the same
+  // connections (e.g. host swaps files while a previous transfer is still draining).
+  const activeSendGenerationRef = useRef(0);
 
   const closeRoom = useCallback(() => {
     onEventRef.current("info", "ROOM", "Initiating room closure. Terminating all peer connections.");
@@ -315,6 +354,10 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     setFileReceiveProgress(null);
     fileStreamHandlersRef.current.clear();
     peerHealthRef.current.clear();
+    guestActionHistoryRef.current.clear();
+    resumeInfoRef.current.clear();
+    resumeWaitersRef.current.clear();
+    activeSendGenerationRef.current += 1;
   }, []);
 
   useEffect(() => {
@@ -457,7 +500,13 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         if (handlers) {
           fileStreamHandlersRef.current.set(meta.mediaId, handlers);
         }
-        setFileReceiveProgress({ mediaId: meta.mediaId, fileName: meta.fileName, chunksReceived: 0, total: meta.totalChunks, totalBytes: meta.fileSize });
+        setFileReceiveProgress({
+          mediaId: meta.mediaId,
+          fileName: meta.fileName,
+          chunksReceived: handlers?.alreadyReceivedCount ?? 0,
+          total: meta.totalChunks,
+          totalBytes: meta.fileSize
+        });
         return;
       }
 
@@ -467,12 +516,22 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         if (handlers) {
           const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
           handlers.onChunk(index, total, bytes, checksum);
-          
+
           setFileReceiveProgress((prev) => {
             if (prev?.mediaId !== mediaId) return prev;
             const newReceived = prev.chunksReceived + 1;
-            // Echo progress back to host using the new cumulative value
-            sendToOne(conn, "file.progress", { mediaId, chunksReceived: newReceived, total });
+
+            // Echo progress back to the sender, but throttled — echoing on
+            // every 64KB chunk would roughly double message traffic on the
+            // channel. Always echo the last chunk so the sender's progress
+            // bar actually reaches 100% instead of stalling on a throttled value.
+            const now = performance.now();
+            const lastEchoAt = lastProgressEchoAtRef.current.get(mediaId) ?? 0;
+            if (newReceived >= total || now - lastEchoAt >= PROGRESS_ECHO_INTERVAL_MS) {
+              lastProgressEchoAtRef.current.set(mediaId, now);
+              sendToOne(conn, "file.progress", { mediaId, chunksReceived: newReceived, total });
+            }
+
             return { ...prev, chunksReceived: newReceived };
           });
         }
@@ -494,6 +553,22 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       if (message.type === "file.progress") {
         const { chunksReceived, total } = message.payload;
         setFileSendProgress((prev) => prev ? { ...prev, chunksSent: chunksReceived, total } : prev);
+        return;
+      }
+
+      if (message.type === "file.resume") {
+        // Host-side: a peer is reporting which chunks it already has for a
+        // mediaId (empty ranges for a fresh transfer). Feed sendFile's wait
+        // step if it's actively waiting on this peer, and cache it either way
+        // in case sendFile hasn't started waiting yet.
+        const peerKey = conn.peer;
+        resumeInfoRef.current.set(peerKey, { mediaId: message.payload.mediaId, ranges: message.payload.receivedRanges });
+
+        const waiter = resumeWaitersRef.current.get(peerKey);
+        if (waiter) {
+          resumeWaitersRef.current.delete(peerKey);
+          waiter(message.payload.receivedRanges);
+        }
         return;
       }
 
@@ -556,6 +631,40 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         peerHealthRef.current.set(peerKey, state);
         return;
       }
+
+      if (message.type === "playback.guestAction") {
+        // Host-side authoritative rate limit: pause/seek share one budget of
+        // GUEST_ACTION_LIMIT per GUEST_ACTION_WINDOW_MS per peer, enforced
+        // here regardless of the sender's own client-side gate (which can be
+        // bypassed). Resume is exempt — never counted, never blocked — so a
+        // guest who paused can always un-pause.
+        const peerKey = conn.peer;
+
+        if (message.payload.action === "resume") {
+          onGuestActionRef.current?.(message.payload.action, message.payload.snapshot, peerKey);
+          return;
+        }
+
+        const now = performance.now();
+        const recent = (guestActionHistoryRef.current.get(peerKey) ?? []).filter(
+          (t) => now - t < GUEST_ACTION_WINDOW_MS
+        );
+
+        if (recent.length >= GUEST_ACTION_LIMIT) {
+          guestActionHistoryRef.current.set(peerKey, recent);
+          onEventRef.current(
+            "warn",
+            "SYNC",
+            `${peerKey}: control rate limit reached (${GUEST_ACTION_LIMIT}/min), ignored ${message.payload.action}.`
+          );
+          return;
+        }
+
+        recent.push(now);
+        guestActionHistoryRef.current.set(peerKey, recent);
+        onGuestActionRef.current?.(message.payload.action, message.payload.snapshot, peerKey);
+        return;
+      }
     },
     [sendToOne]
   );
@@ -568,6 +677,22 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     [send]
   );
 
+  /** Guest-side: forward a pause/resume/seek to the host so it reverse-syncs to the room. */
+  const sendGuestAction = useCallback(
+    (action: GuestPlaybackAction, snapshot: PlaybackSnapshot) => {
+      send("playback.guestAction", { action, snapshot });
+    },
+    [send]
+  );
+
+  /** Guest-side: report which chunks of mediaId we already have (empty for a fresh transfer). */
+  const sendFileResume = useCallback(
+    (mediaId: string, receivedRanges: Array<[number, number]>) => {
+      send("file.resume", { mediaId, receivedRanges });
+    },
+    [send]
+  );
+
   /**
    * Stream a File to a specific connection (or all connections).
    * Uses a Web Worker to read + hash chunks off the main thread.
@@ -575,10 +700,15 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
    */
   const sendFile = useCallback(
     async (file: File, mediaId: string, targetPeerIds?: string[]) => {
-      const conns = targetPeerIds 
-        ? connectionsRef.current.filter(c => targetPeerIds.includes(c.peer)) 
+      const conns = targetPeerIds
+        ? connectionsRef.current.filter(c => targetPeerIds.includes(c.peer))
         : connectionsRef.current;
       if (conns.length === 0) return;
+
+      // Cancel any previous in-flight transfer instead of letting two run
+      // concurrently and fight over the same connections' flow control.
+      const generation = ++activeSendGenerationRef.current;
+      const isCurrent = () => activeSendGenerationRef.current === generation;
 
       const mimeType = file.type || "video/mp4";
       const { inferMediaFormat } = await import("@/lib/media/mediaTypes");
@@ -596,11 +726,6 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       };
 
       setFileSendProgress({ mediaId, fileName: file.name, chunksSent: 0, total: totalChunks, totalBytes: file.size });
-      onEventRef.current(
-        "info",
-        "FILE",
-        `Starting blob transfer of "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB) to ${conns.length} peer connection(s)`
-      );
 
       // Group connections by peer ID for multiplexing
       const peerConns = new Map<string, DataConnection[]>();
@@ -609,16 +734,61 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         peerConns.get(c.peer)!.push(c);
       });
 
-      // Broadcast file.meta to ONE connection per peer
-      peerConns.forEach((connections) => {
-        const firstOpen = connections.find(c => c.open);
-        if (firstOpen) sendToOne(firstOpen, "file.meta", meta);
-      });
+      // Send file.meta to ONE connection per peer, then give each peer a brief
+      // window to reply with "file.resume" — which chunks (if any) it already
+      // has for this exact mediaId, e.g. because it was mid-download before a
+      // reconnect. Guests always reply promptly, even with empty ranges, so
+      // this resolves fast for the common fresh-transfer case; the timeout is
+      // just a safety net for a lost/delayed reply.
+      const getResumeRanges = (peerId: string): Promise<Array<[number, number]>> => {
+        const cached = resumeInfoRef.current.get(peerId);
+        if (cached && cached.mediaId === mediaId) {
+          resumeInfoRef.current.delete(peerId);
+          return Promise.resolve(cached.ranges);
+        }
+        return new Promise((resolve) => {
+          const timeout = window.setTimeout(() => {
+            resumeWaitersRef.current.delete(peerId);
+            resolve([]);
+          }, RESUME_ACK_TIMEOUT_MS);
+          resumeWaitersRef.current.set(peerId, (ranges) => {
+            window.clearTimeout(timeout);
+            resolve(ranges ?? []);
+          });
+        });
+      };
+
+      const peerSkipRanges = new Map<string, Array<[number, number]>>();
+      await Promise.all(
+        Array.from(peerConns.entries()).map(async ([peerId, connections]) => {
+          const firstOpen = connections.find(c => c.open);
+          if (!firstOpen) return;
+          sendToOne(firstOpen, "file.meta", meta);
+          const ranges = await getResumeRanges(peerId);
+          if (ranges.length > 0) {
+            peerSkipRanges.set(peerId, ranges);
+            const alreadyHave = ranges.reduce((sum, [start, end]) => sum + (end - start + 1), 0);
+            onEventRef.current("ok", "FILE", `${peerId}: resuming transfer — already has ${alreadyHave}/${totalChunks} chunks, skipping those.`);
+          }
+        })
+      );
+
+      if (!isCurrent()) return; // superseded by a newer sendFile() call while we were waiting on resume replies
+
+      onEventRef.current(
+        "info",
+        "FILE",
+        `Starting blob transfer of "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB) to ${conns.length} peer connection(s)`
+      );
 
       const chunkQueue: Array<{ index: number; total: number; data: Uint8Array; checksum: string }> = [];
+      // Per-chunk checksums, kept independent of the queue above (which drains
+      // as chunks are sent) so we can compute a whole-file integrity check —
+      // see combineChecksums — once every chunk has been produced.
+      const chunkChecksums = new Map<number, string>();
       let drainActive = false;
       let endSent = false;
-      
+
       let workersActive = 0;
       let workersDone = 0;
       let workerError: string | null = null;
@@ -633,10 +803,23 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
 
           try {
             while (chunkQueue.length > 0) {
+              if (!isCurrent()) {
+                resolve();
+                return;
+              }
+
               const chunk = chunkQueue.shift()!;
-              
-              // Send to each peer via round-robin over their available multiplexed connections
+
+              // Send to each peer via round-robin over their available multiplexed
+              // connections. Order doesn't need to match chunk index — the receiver
+              // writes each chunk to its own byte offset in OPFS, so there's no
+              // correctness reason to keep this queue sorted by index.
               for (const [peerId, connections] of peerConns.entries()) {
+                const skipRanges = peerSkipRanges.get(peerId);
+                if (skipRanges && rangesInclude(skipRanges, chunk.index)) {
+                  continue;
+                }
+
                 const openConns = connections.filter(c => c.open);
                 if (openConns.length === 0) continue;
 
@@ -663,11 +846,12 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
 
             if (workersDone === workersActive && !endSent && chunkQueue.length === 0) {
               endSent = true;
-              for (const [peerId, connections] of peerConns.entries()) {
+              const fileChecksum = combineChecksums(chunkChecksums, totalChunks);
+              for (const [, connections] of peerConns.entries()) {
                 const firstOpen = connections.find(c => c.open);
                 if (!firstOpen) continue;
                 await waitForDrain(firstOpen);
-                sendToOne(firstOpen, "file.end", { mediaId, checksum: "" });
+                sendToOne(firstOpen, "file.end", { mediaId, checksum: fileChecksum });
                 await waitForDrain(firstOpen);
               }
               onEventRef.current("ok", "FILE", `File "${file.name}" fully sent.`);
@@ -677,7 +861,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
             rejectTransfer(error);
           } finally {
             drainActive = false;
-            if (chunkQueue.length > 0 || (workersDone === workersActive && !endSent)) {
+            if (isCurrent() && (chunkQueue.length > 0 || (workersDone === workersActive && !endSent))) {
               void drainQueue();
             }
           }
@@ -702,6 +886,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
           );
 
           worker.onmessage = (event: MessageEvent) => {
+            if (!isCurrent()) {
+              worker.terminate();
+              return;
+            }
+
             const msg = event.data as { type: string; [k: string]: unknown };
             if (msg.type === "ready") return;
             if (msg.type === "error") {
@@ -710,13 +899,15 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
               return;
             }
             if (msg.type === "chunk") {
+              const index = msg.index as number;
+              const checksum = msg.checksum as string;
+              chunkChecksums.set(index, checksum);
               chunkQueue.push({
-                index: msg.index as number,
+                index,
                 total: msg.total as number,
                 data: msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data as ArrayLike<number>),
-                checksum: msg.checksum as string
+                checksum
               });
-              chunkQueue.sort((a, b) => a.index - b.index);
               void drainQueue();
             }
             if (msg.type === "worker_done") {
@@ -728,10 +919,10 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
 
           worker.onerror = (err) => reject(new Error(err.message));
 
-          worker.postMessage({ 
-            type: "start", 
-            file, 
-            mediaId, 
+          worker.postMessage({
+            type: "start",
+            file,
+            mediaId,
             chunkSize: CHUNK_SIZE,
             startChunkIndex,
             endChunkIndex,
@@ -739,10 +930,12 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
           });
         }
       }).catch((err: unknown) => {
-        onEventRef.current("error", "FILE", `File transfer failed: ${err instanceof Error ? err.message : "unknown error"}`);
+        if (isCurrent()) {
+          onEventRef.current("error", "FILE", `File transfer failed: ${err instanceof Error ? err.message : "unknown error"}`);
+        }
       });
 
-      if (!workerError && workersDone === workersActive) {
+      if (isCurrent() && !workerError && workersDone === workersActive) {
         setFileSendProgress(null);
       }
     },
@@ -797,6 +990,9 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
           // Last channel for this peer closed — drop its adaptive cadence state
           // so a future rejoin starts fresh at the fastest interval.
           peerHealthRef.current.delete(conn.peer);
+          guestActionHistoryRef.current.delete(conn.peer);
+          resumeInfoRef.current.delete(conn.peer);
+          resumeWaitersRef.current.delete(conn.peer);
         }
         if (connectionsRef.current.length === 0) {
           setStatus("disconnected");
@@ -973,6 +1169,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     sendConfigState,
     broadcastConfigChanged,
     reportSyncHealth,
+    sendGuestAction,
+    sendFileResume,
     sendFile
   };
 }

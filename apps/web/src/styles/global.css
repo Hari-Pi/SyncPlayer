@@ -507,6 +507,41 @@ textarea {
   width: min(38rem, 100%);
 }
 
+/* ── Upload lock overlay ───────────────────────────────────────────────────── */
+/* Covers the player surface while the host is streaming a local file to
+   viewers, so nobody gets a head start on watching before everyone has it. */
+.upload-lock-overlay {
+  align-items: center;
+  background: rgba(1, 5, 8, 0.94);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  inset: 0;
+  justify-content: center;
+  padding: 1.5rem;
+  position: absolute;
+  text-align: center;
+  z-index: 4;
+}
+
+.upload-lock-overlay svg {
+  color: var(--accent);
+  filter: drop-shadow(0 0 10px rgba(55, 243, 255, 0.35));
+}
+
+.upload-lock-overlay strong {
+  font-size: 1rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.upload-lock-overlay span {
+  color: var(--muted);
+  font-size: 0.82rem;
+  max-width: 32rem;
+}
+
 .control-strip {
   align-items: center;
   background: var(--panel-strong);
@@ -521,6 +556,19 @@ textarea {
 
 .file-button input {
   display: none;
+}
+
+.file-button--disabled,
+.control-strip button:disabled,
+.control-strip input:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.file-button--disabled:hover {
+  background: rgba(55, 243, 255, 0.06);
+  border-color: rgba(55, 243, 255, 0.45);
+  box-shadow: none;
 }
 
 .url-loader {

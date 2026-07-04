@@ -8,6 +8,7 @@ import {
   Github,
   Hash,
   Link2,
+  Lock,
   LogIn,
   Pause,
   QrCode,
@@ -30,10 +31,11 @@ import { ActivityLogPanel } from "@/components/room/ActivityLogPanel";
 import { FileProgressBar } from "@/components/room/FileProgressBar";
 import { createMediaHint, type DriftReading } from "@/lib/wasm/syncCore";
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
-import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia } from "@/lib/media/mediaTypes";
+import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia, type MediaKind, type MediaFormat } from "@/lib/media/mediaTypes";
+import { combineChecksums, indicesToRanges } from "@/lib/media/checksum";
 import { createLocalTabChannel } from "@/lib/sync/localTabSync";
 import { cx } from "@/lib/ui/cx";
-import type { PlaybackSnapshot, FileMeta, RemoteMediaMount, PlaybackConfig } from "@/lib/webrtc/messages";
+import type { PlaybackSnapshot, FileMeta, RemoteMediaMount, PlaybackConfig, GuestPlaybackAction } from "@/lib/webrtc/messages";
 import { CHUNK_SIZE } from "@/lib/webrtc/messages";
 import type { DataConnection } from "peerjs";
 import type { FileStreamHandlers } from "@/features/room/usePeerRoom";
@@ -68,6 +70,14 @@ const SEEK_COOLDOWN_MS = 1500;
 // Smooth drift over a short rolling window so a single noisy sample
 // (e.g. a late/jittery message) doesn't trigger an aggressive correction.
 const DRIFT_SMOOTHING_SAMPLES = 3;
+
+// Viewers can pause/seek and reverse-sync that to the host; the two share one
+// budget per rolling window so a viewer can't spam controls and annoy the
+// rest of the room. Resume is exempt (see handlePlaybackAction). The host
+// enforces this too (see usePeerRoom), this client-side copy just avoids
+// sending doomed actions.
+const GUEST_ACTION_LIMIT = 3;
+const GUEST_ACTION_WINDOW_MS = 60_000;
 
 /** Seconds of buffered media ahead of the element's current playback position. */
 function getBufferedAheadSecs(element: HTMLMediaElement): number {
@@ -150,6 +160,31 @@ function copyText(value: string) {
 
   void navigator.clipboard?.writeText(value);
 }
+
+/**
+ * Guest-side state for one incoming file transfer's OPFS write session.
+ * Lives in a ref (activeFileWriteRef) rather than a closure-local variable so
+ * a repeat "file.meta" for the same mediaId — e.g. the host re-streaming to a
+ * peer that just reconnected — can detect and resume it instead of tearing
+ * down and re-downloading everything from scratch.
+ */
+type ActiveFileWrite = {
+  mediaId: string;
+  fileName: string;
+  totalChunks: number;
+  kind: MediaKind;
+  format: MediaFormat;
+  opfsFileName: string;
+  opfsFileHandle: FileSystemFileHandle | null;
+  writableStream: FileSystemWritableFileStream | null;
+  writeQueue: Promise<void>;
+  receivedIndices: Set<number>;
+  chunkChecksums: Map<number, string>;
+  pendingHostChecksum: string | null;
+  endReceived: boolean;
+  finalized: boolean;
+  aborted: boolean;
+};
 
 type ShareMedia = Pick<LoadedMedia, "id" | "title" | "sourceUrl" | "kind" | "format" | "origin">;
 type ShareRtcConfig = Pick<RTCConfiguration, "iceServers" | "iceTransportPolicy">;
@@ -290,6 +325,9 @@ export function App() {
   const lastSeekAtRef = useRef(0);
   // True while the local media element is stalled waiting for data.
   const isStalledRef = useRef(false);
+  // Guest-side: rolling timestamps of accepted control actions (pause/resume/seek
+  // share one budget), used for the client-side rate-limit gate.
+  const guestActionHistoryRef = useRef<number[]>([]);
   const [clock, setClock] = useState(formatClock());
   const [media, setMedia] = useState<LoadedMedia | null>(null);
   // Keep a ref to the live media so async callbacks always see the current value,
@@ -305,6 +343,11 @@ export function App() {
   const guestFileRef = useRef<File | null>(null);
   const opfsFileHandleRef = useRef<FileSystemFileHandle | null>(null);
   const opfsFileNameRef = useRef<string | null>(null);
+  // Guest-side: the currently in-flight (or just-completed) OPFS write session.
+  // Kept in a ref (not local closure state) so a second file.meta for the same
+  // mediaId — e.g. after a reconnect — can detect and resume it instead of
+  // starting over from byte zero.
+  const activeFileWriteRef = useRef<ActiveFileWrite | null>(null);
   const handledShareLinkRef = useRef(false);
   const localTabChannelRef = useRef<ReturnType<typeof createLocalTabChannel>>(null);
   const hostFileRef = useRef<File | null>(null);
@@ -418,6 +461,11 @@ export function App() {
     guestFileRef.current = null;
     hlsRef.current = null;
     dashRef.current = null;
+    if (activeFileWriteRef.current) {
+      // Mark the old session dead so any writes still queued for it become no-ops.
+      activeFileWriteRef.current.aborted = true;
+      activeFileWriteRef.current = null;
+    }
     if (!fileName) return;
     navigator.storage.getDirectory().then((root) => {
       root.removeEntry(fileName).catch(() => { /* file may not exist */ });
@@ -425,100 +473,150 @@ export function App() {
   }, []);
 
   // ── Guest file stream receiver ─────────────────────────────────────────────
+  // Supports resuming: if this is a repeat file.meta for a mediaId we already
+  // have a live (unfinished, unaborted) write session for — e.g. the host
+  // re-streaming to us after a reconnect — we reuse that session instead of
+  // starting over, and tell the host which chunks to skip re-sending.
   const handleFileStream = useCallback((meta: FileMeta): FileStreamHandlers => {
-    cleanupOpfsFile();
-    setGuestStreamUrl((previousUrl) => {
-      if (previousUrl) {
-        staleBlobUrlRef.current = previousUrl;
-      }
-      return null;
-    });
-    setGuestStreamMeta(meta);
-    log("info", "FILE", `Receiving "${meta.fileName}" (${(meta.fileSize / 1024 / 1024).toFixed(1)} MB) to local disk...`);
+    const existing = activeFileWriteRef.current;
+    const isResume = !!existing && existing.mediaId === meta.mediaId && !existing.finalized && !existing.aborted;
 
-    const kind = inferMediaKind(meta.mimeType || meta.fileName);
-    const format = meta.format;
-    const opfsFileName = `syncplayer-transfer-${meta.mediaId}`;
+    let write: ActiveFileWrite;
 
-    let opfsFileHandle: FileSystemFileHandle | null = null;
-    let writableStream: FileSystemWritableFileStream | null = null;
-    let writeQueue: Promise<void> = Promise.resolve();
-    let aborted = false;
-    let receivedChunks = 0;
-    let endPending = false;
-    let finalized = false;
+    if (isResume) {
+      write = existing!;
+      setGuestStreamMeta(meta);
+      log(
+        "info",
+        "FILE",
+        `Resuming "${meta.fileName}" — already have ${write.receivedIndices.size}/${meta.totalChunks} chunks, requesting the rest.`
+      );
+    } else {
+      cleanupOpfsFile();
+      setGuestStreamUrl((previousUrl) => {
+        if (previousUrl) {
+          staleBlobUrlRef.current = previousUrl;
+        }
+        return null;
+      });
+      setGuestStreamMeta(meta);
+      log("info", "FILE", `Receiving "${meta.fileName}" (${(meta.fileSize / 1024 / 1024).toFixed(1)} MB) to local disk...`);
+
+      const opfsFileName = `syncplayer-transfer-${meta.mediaId}`;
+      write = {
+        mediaId: meta.mediaId,
+        fileName: meta.fileName,
+        totalChunks: meta.totalChunks,
+        kind: inferMediaKind(meta.mimeType || meta.fileName),
+        format: meta.format,
+        opfsFileName,
+        opfsFileHandle: null,
+        writableStream: null,
+        writeQueue: Promise.resolve(),
+        receivedIndices: new Set(),
+        chunkChecksums: new Map(),
+        pendingHostChecksum: null,
+        endReceived: false,
+        finalized: false,
+        aborted: false
+      };
+      activeFileWriteRef.current = write;
+
+      write.writeQueue = write.writeQueue.then(async () => {
+        try {
+          const root = await navigator.storage.getDirectory();
+          const handle = await root.getFileHandle(opfsFileName, { create: true });
+          write.opfsFileHandle = handle;
+          write.writableStream = await handle.createWritable();
+        } catch (err) {
+          log("error", "FILE", `Failed to initialize OPFS storage: ${err instanceof Error ? err.message : String(err)}`);
+          write.aborted = true;
+        }
+      });
+    }
+
+    // Tell the host what we already have (empty ranges for a fresh transfer,
+    // in which case this just lets the host proceed without waiting out its
+    // full resume-ack timeout).
+    roomRef.current?.sendFileResume(meta.mediaId, indicesToRanges(write.receivedIndices));
 
     const finalizeFile = () => {
-      if (finalized || aborted) return;
-      finalized = true;
+      if (write.finalized || write.aborted) return;
+      write.finalized = true;
 
-      writeQueue = writeQueue.then(async () => {
-        if (!writableStream || !opfsFileHandle) return;
+      write.writeQueue = write.writeQueue.then(async () => {
+        if (!write.writableStream || !write.opfsFileHandle) return;
         try {
-          await writableStream.close();
-          const file = await opfsFileHandle.getFile();
+          const combined = combineChecksums(write.chunkChecksums, write.totalChunks);
+          if (write.pendingHostChecksum && combined !== write.pendingHostChecksum) {
+            log(
+              "warn",
+              "FILE",
+              `Integrity check mismatch for "${write.fileName}" — the received chunk set doesn't match what the host sent. Playback may have gaps.`
+            );
+          } else {
+            log("ok", "FILE", `Integrity check passed for "${write.fileName}".`);
+          }
+
+          await write.writableStream.close();
+          const file = await write.opfsFileHandle.getFile();
           guestFileRef.current = file;
-          opfsFileHandleRef.current = opfsFileHandle;
-          opfsFileNameRef.current = opfsFileName;
+          opfsFileHandleRef.current = write.opfsFileHandle;
+          opfsFileNameRef.current = write.opfsFileName;
           const url = URL.createObjectURL(file);
 
           setGuestStreamUrl(url);
           setMedia({
-            id: meta.mediaId,
-            title: meta.fileName,
+            id: write.mediaId,
+            title: write.fileName,
             sourceUrl: url,
-            kind,
-            format,
+            kind: write.kind,
+            format: write.format,
             origin: "local-file",
-            sizeBytes: meta.fileSize,
+            sizeBytes: file.size
           });
           setGuestStreamMeta(null);
-          log("ok", "FILE", `"${meta.fileName}" completely downloaded and mounted for playback.`);
+          log("ok", "FILE", `"${write.fileName}" completely downloaded and mounted for playback.`);
         } catch (err) {
           log("error", "FILE", `Failed to finalize file transfer: ${err instanceof Error ? err.message : String(err)}`);
         }
       });
     };
 
-    // Initialize OPFS
-    writeQueue = writeQueue.then(async () => {
-      try {
-        const root = await navigator.storage.getDirectory();
-        opfsFileHandle = await root.getFileHandle(opfsFileName, { create: true });
-        writableStream = await opfsFileHandle.createWritable();
-      } catch (err) {
-        log("error", "FILE", `Failed to initialize OPFS storage: ${err instanceof Error ? err.message : String(err)}`);
-        aborted = true;
-      }
-    });
-
     return {
-      onChunk: (index, _total, data) => {
-        if (aborted || finalized) return;
-        writeQueue = writeQueue.then(async () => {
-          if (!writableStream || aborted || finalized) return;
+      alreadyReceivedCount: write.receivedIndices.size,
+      onChunk: (index, _total, data, checksum) => {
+        if (write.aborted || write.finalized || write.receivedIndices.has(index)) return;
+
+        write.writeQueue = write.writeQueue.then(async () => {
+          if (!write.writableStream || write.aborted || write.finalized) return;
           try {
-            await writableStream.write({
+            await write.writableStream.write({
               type: "write",
               position: index * CHUNK_SIZE,
               data: data.buffer as ArrayBuffer
             });
           } catch (err) {
             log("error", "FILE", `Failed to write chunk ${index}: ${err instanceof Error ? err.message : String(err)}`);
-            aborted = true;
+            write.aborted = true;
+            return;
+          }
+
+          write.receivedIndices.add(index);
+          write.chunkChecksums.set(index, checksum);
+
+          if (write.endReceived && write.receivedIndices.size >= write.totalChunks) {
+            finalizeFile();
           }
         });
-        receivedChunks++;
-        if (endPending && receivedChunks >= meta.totalChunks) {
-          finalizeFile();
-        }
       },
-      onEnd: () => {
-        if (aborted) return;
-        if (receivedChunks >= meta.totalChunks) {
+      onEnd: (checksum) => {
+        if (write.aborted) return;
+        write.pendingHostChecksum = checksum || null;
+        if (write.receivedIndices.size >= write.totalChunks) {
           finalizeFile();
         } else {
-          endPending = true;
+          write.endReceived = true;
         }
       }
     };
@@ -610,6 +708,35 @@ export function App() {
     roomRef.current?.sendConfigRequest();
   }, []);
 
+  // Host-side: a viewer's pause/resume/seek passed the host's rate-limit check.
+  // Adopt it on the host's own player — the normal 250ms publish loop then
+  // picks up the new state and broadcasts it to the whole room as usual.
+  const handleGuestAction = useCallback(
+    (action: GuestPlaybackAction, snapshot: PlaybackSnapshot, peerId: string) => {
+      const element = mediaRef.current;
+      if (!element) return;
+
+      remoteApplyRef.current = true;
+
+      if (action === "pause") {
+        element.pause();
+      } else if (action === "resume") {
+        void element.play().catch(() => {
+          log("warn", "PLAYBACK", "Browser blocked autoplay while applying a viewer's resume action.");
+        });
+      } else if (action === "seek") {
+        element.currentTime = snapshot.position;
+      }
+
+      log("info", "SYNC", `Viewer ${peerId} triggered ${action}. Host adopted it and will broadcast to the room.`);
+
+      window.setTimeout(() => {
+        remoteApplyRef.current = false;
+      }, 250);
+    },
+    [log]
+  );
+
   const room = usePeerRoom({
     onPlaybackState: handleRemotePlayback,
     onEvent: log,
@@ -617,7 +744,8 @@ export function App() {
     onMediaMount: handleRemoteMediaMount,
     onConfigRequest: handleConfigRequest,
     onConfigState: handleConfigState,
-    onConfigChanged: handleConfigChanged
+    onConfigChanged: handleConfigChanged,
+    onGuestAction: handleGuestAction
   });
 
   useEffect(() => {
@@ -725,6 +853,19 @@ export function App() {
       setDrift({ driftMs: room.latencyMs, mode: "hold", rate: 1 });
     }
   }, [room.role, room.status, room.latencyMs]);
+
+  // Pause the host's own playback the moment a file upload to viewers starts
+  // (rising edge only, so this doesn't re-fire on every progress tick). The
+  // player surface gets locked/covered by a progress view for the duration —
+  // see isUploadLocked — so there's nothing to resume until it finishes.
+  const wasUploadingRef = useRef(false);
+  useEffect(() => {
+    const isUploading = room.role === "host" && !!room.fileSendProgress;
+    if (isUploading && !wasUploadingRef.current) {
+      mediaRef.current?.pause();
+    }
+    wasUploadingRef.current = isUploading;
+  }, [room.role, room.fileSendProgress]);
 
   // Guest: request config from host on connect
   useEffect(() => {
@@ -881,21 +1022,64 @@ export function App() {
     log("ok", "SHARE", "Activity logs copied to clipboard.");
   }, [activity, log]);
 
-  const handlePause = useCallback(() => {
-    const element = mediaRef.current;
-    if (!element) return;
+  // Shared handler for pause/resume/seek. Host and solo remain the simple
+  // "just broadcast" case. Guests can now have their action reverse-sync to
+  // the host too. Pause and seek share a rate-limit budget so a viewer can't
+  // spam controls — beyond the budget, the action still happens locally
+  // (nothing stops that) but isn't forwarded, so the host's next broadcast
+  // quietly overrides it back, same as the old guest behavior. Resume is
+  // exempt: it's not counted and never blocked, since a guest who paused
+  // needs to be able to un-pause even after using up their budget.
+  const handlePlaybackAction = useCallback(
+    (action: GuestPlaybackAction) => {
+      const element = mediaRef.current;
+      if (!element || remoteApplyRef.current) {
+        return;
+      }
 
-    // If we're applying a remote snapshot, suppress the broadcast.
-    if (remoteApplyRef.current) {
-      return;
-    }
+      if (room.role === "host" || room.role === "solo") {
+        publishSnapshot(true);
+        return;
+      }
 
-    // Only the host broadcasts pause state. Guests can pause locally but the
-    // host's 250ms stream will override it — host is the single source of truth.
-    if (room.role === "host" || room.role === "solo") {
-      publishSnapshot(true);
-    }
-  }, [room.role, publishSnapshot]);
+      if (room.role !== "guest") {
+        return;
+      }
+
+      if (action !== "resume") {
+        const now = performance.now();
+        const recent = guestActionHistoryRef.current.filter((t) => now - t < GUEST_ACTION_WINDOW_MS);
+
+        if (recent.length >= GUEST_ACTION_LIMIT) {
+          guestActionHistoryRef.current = recent;
+          const oldest = Math.min(...recent);
+          const waitSecs = Math.ceil((GUEST_ACTION_WINDOW_MS - (now - oldest)) / 1000);
+          log("warn", "SYNC", `Control rate limit reached. Wait ${waitSecs}s before another ${action} syncs to the room.`);
+          return;
+        }
+
+        recent.push(now);
+        guestActionHistoryRef.current = recent;
+      }
+
+      const snapshot: PlaybackSnapshot = {
+        mediaId: mediaStateRef.current?.id ?? null,
+        position: element.currentTime,
+        duration: element.duration || 0,
+        paused: element.paused,
+        playbackRate: element.playbackRate
+      };
+
+      setSnapshot(snapshot);
+      roomRef.current?.sendGuestAction(action, snapshot);
+      log("ok", "SYNC", `Sent ${action} to host — syncing the room.`);
+    },
+    [room.role, publishSnapshot, log]
+  );
+
+  const handlePause = useCallback(() => handlePlaybackAction("pause"), [handlePlaybackAction]);
+  const handleResume = useCallback(() => handlePlaybackAction("resume"), [handlePlaybackAction]);
+  const handleSeeked = useCallback(() => handlePlaybackAction("seek"), [handlePlaybackAction]);
 
   const handleLoadedMetadata = useCallback(async () => {
     const element = mediaRef.current;
@@ -1006,6 +1190,8 @@ export function App() {
 
   const publishSnapshotRef = useRef(publishSnapshot);
   const handlePauseRef = useRef(handlePause);
+  const handleResumeRef = useRef(handleResume);
+  const handleSeekedRef = useRef(handleSeeked);
   const handleLoadedMetadataRef = useRef(handleLoadedMetadata);
 
   useEffect(() => {
@@ -1015,6 +1201,14 @@ export function App() {
   useEffect(() => {
     handlePauseRef.current = handlePause;
   }, [handlePause]);
+
+  useEffect(() => {
+    handleResumeRef.current = handleResume;
+  }, [handleResume]);
+
+  useEffect(() => {
+    handleSeekedRef.current = handleSeeked;
+  }, [handleSeeked]);
 
   useEffect(() => {
     handleLoadedMetadataRef.current = handleLoadedMetadata;
@@ -1296,9 +1490,9 @@ export function App() {
       const video = art.video;
       mediaRef.current = video;
 
-      const onPlay = () => publishSnapshotRef.current(true);
+      const onPlay = () => handleResumeRef.current();
       const onPause = () => handlePauseRef.current();
-      const onSeeked = () => publishSnapshotRef.current(true);
+      const onSeeked = () => handleSeekedRef.current();
       const onRateChange = () => publishSnapshotRef.current(true);
       const onLoadedMetadata = () => handleLoadedMetadataRef.current();
       const onWaiting = () => { isStalledRef.current = true; };
@@ -1338,6 +1532,12 @@ export function App() {
 
   const statusTone = room.status === "connected" ? "ok" : room.status === "failed" ? "warn" : "normal";
   const mediaIcon = media?.kind === "audio" ? <AudioLines size={17} /> : <FileVideo size={17} />;
+
+  // While the host is actively streaming a local file to viewers, lock the
+  // player surface and show upload progress instead — keeps the host from
+  // getting a head start on playback (or drifting into a big correction)
+  // while viewers are still receiving the file.
+  const isUploadLocked = room.role === "host" && !!room.fileSendProgress;
 
   const driftTone = useMemo(() => {
     if (drift.mode === "hold" || drift.mode === "soft") {
@@ -1533,10 +1733,10 @@ export function App() {
 
         <section className="main-stage">
           <div className="control-strip">
-            <label className="file-button">
+            <label className={cx("file-button", isUploadLocked && "file-button--disabled")}>
               <Upload size={16} />
               Select File
-              <input accept="audio/*,video/*" type="file" onChange={handleLocalFile} />
+              <input accept="audio/*,video/*" type="file" onChange={handleLocalFile} disabled={isUploadLocked} />
             </label>
             <div className="url-loader">
               <Link2 size={16} />
@@ -1550,8 +1750,9 @@ export function App() {
                 }}
                 placeholder="Paste MP4, MP3, M3U8, MPD, WebM..."
                 aria-label="Remote media URL, including MP4, WebM, M3U8, MPD, MP3, WAV, or OGG"
+                disabled={isUploadLocked}
               />
-              <button type="button" onClick={handleRemoteUrl}>
+              <button type="button" onClick={handleRemoteUrl} disabled={isUploadLocked}>
                 <Send size={15} />
                 Load URL
               </button>
@@ -1580,9 +1781,9 @@ export function App() {
                       ref={bindMediaElement}
                       controls
                       onLoadedMetadata={handleLoadedMetadata}
-                      onPlay={() => publishSnapshot(true)}
+                      onPlay={handleResume}
                       onPause={handlePause}
-                      onSeeked={() => publishSnapshot(true)}
+                      onSeeked={handleSeeked}
                       onRateChange={() => publishSnapshot(true)}
                       onTimeUpdate={() => publishSnapshot(false)}
                       onWaiting={() => { isStalledRef.current = true; }}
@@ -1600,6 +1801,28 @@ export function App() {
                   <ScanLine size={54} />
                   <strong>{guestStreamMeta ? `Receiving "${guestStreamMeta.fileName}"...` : "Mount media to begin"}</strong>
                   <span>{guestStreamMeta ? `${guestStreamMeta.isBlob ? "Full file transfer" : "MSE progressive stream"} in progress` : "Local files stream to viewers automatically over P2P."}</span>
+                </div>
+              )}
+
+              {/* Host controls are locked and the player is covered while a
+                  local file streams to viewers, so nobody gets a head start
+                  on watching before everyone actually has the file. */}
+              {isUploadLocked && room.fileSendProgress && (
+                <div className="upload-lock-overlay">
+                  <Lock size={40} />
+                  <strong>Uploading to viewers</strong>
+                  <span>
+                    Playback is locked until "{room.fileSendProgress.fileName}" finishes sending to{" "}
+                    {room.connectedPeers.length} viewer{room.connectedPeers.length === 1 ? "" : "s"}.
+                  </span>
+                  <FileProgressBar
+                    label="Sending"
+                    fileName={room.fileSendProgress.fileName}
+                    chunksDone={room.fileSendProgress.chunksSent}
+                    total={room.fileSendProgress.total}
+                    totalBytes={room.fileSendProgress.totalBytes}
+                    style={{ width: "min(28rem, 100%)" }}
+                  />
                 </div>
               )}
             </div>
