@@ -47,6 +47,14 @@ export type WireMessage =
     }
   | {
       id: string;
+      type: "room.joinDeclined";
+      sentAt: number;
+      payload: {
+        reason?: string;
+      };
+    }
+  | {
+      id: string;
       type: "playback.state";
       sentAt: number;
       payload: PlaybackSnapshot;

@@ -1099,6 +1099,187 @@ textarea {
   will-change: width;
 }
 
+/* ── Allow All Connections toggle ─────────────────────────────────────────── */
+/* A HUD-style switch, not a Material/iOS pill — sharp edges, corner brackets
+   (same motif as .panel), and a glow instead of a filled track. */
+.allow-all-toggle {
+  align-items: center;
+  background: rgba(55, 243, 255, 0.03);
+  border: 1px solid var(--line-soft);
+  cursor: pointer;
+  display: flex;
+  gap: 0.7rem;
+  margin-bottom: 0.55rem;
+  padding: 0.6rem 0.7rem;
+  position: relative;
+  transition: border-color 150ms ease;
+}
+
+/* Both settled positions glow within the primary teal/cyan family — amber is
+   reserved for genuinely transient/in-progress states elsewhere (see
+   .pending-requests, which really is "awaiting a decision"). This is just a
+   settled configuration choice either way, so it never goes amber. */
+.allow-all-toggle::before,
+.allow-all-toggle::after {
+  border-color: var(--accent);
+  border-style: solid;
+  content: "";
+  height: 0.5rem;
+  opacity: 0.75;
+  position: absolute;
+  width: 0.5rem;
+}
+
+.allow-all-toggle::before {
+  border-width: 1px 0 0 1px;
+  left: -1px;
+  top: -1px;
+}
+
+.allow-all-toggle::after {
+  border-width: 0 1px 1px 0;
+  bottom: -1px;
+  right: -1px;
+}
+
+.allow-all-toggle input {
+  height: 0;
+  position: absolute;
+  width: 0;
+  opacity: 0;
+}
+
+.allow-all-toggle__track {
+  background: rgba(3, 7, 11, 0.85);
+  border: 1px solid var(--line);
+  flex-shrink: 0;
+  height: 1.15rem;
+  position: relative;
+  transition: border-color 150ms ease;
+  width: 2.5rem;
+}
+
+.allow-all-toggle__thumb {
+  background: var(--accent-2);
+  box-shadow: 0 0 6px var(--accent-2);
+  height: calc(100% - 6px);
+  left: 3px;
+  position: absolute;
+  top: 2px;
+  transition: transform 150ms ease, background 150ms ease, box-shadow 150ms ease;
+  width: 0.9rem;
+}
+
+.allow-all-toggle input:checked + .allow-all-toggle__track {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 8px rgba(55, 243, 255, 0.25);
+}
+
+.allow-all-toggle input:checked + .allow-all-toggle__track .allow-all-toggle__thumb {
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent);
+  transform: translateX(1.2rem);
+}
+
+.allow-all-toggle input:focus-visible + .allow-all-toggle__track {
+  box-shadow: 0 0 0 2px rgba(55, 243, 255, 0.45);
+}
+
+.allow-all-toggle__copy {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.allow-all-toggle__copy strong {
+  color: var(--text);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.allow-all-toggle__copy span {
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.3;
+}
+
+/* ── Pending Join Requests ─────────────────────────────────────────────────── */
+.pending-requests {
+  background: rgba(255, 180, 84, 0.05);
+  border: 1px solid rgba(255, 180, 84, 0.3);
+  border-radius: 4px;
+  margin-bottom: 0.6rem;
+  padding: 0.65rem 0.7rem;
+}
+
+.pending-requests .section-title {
+  align-items: center;
+  color: var(--warn);
+  display: inline-flex;
+  font-size: 0.68rem;
+  font-weight: 700;
+  gap: 0.35rem;
+  letter-spacing: 0.1em;
+  margin-bottom: 0.5rem;
+  text-transform: uppercase;
+}
+
+.pending-request-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.pending-request-item {
+  align-items: center;
+  background: rgba(255, 180, 84, 0.05);
+  border: 1px solid rgba(255, 180, 84, 0.2);
+  border-radius: 3px;
+  display: flex;
+  gap: 0.5rem;
+  justify-content: space-between;
+  padding: 0.45rem 0.6rem;
+}
+
+.pending-request-item__label {
+  color: var(--text);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.pending-request-item__actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.pending-request-item__accept,
+.pending-request-item__decline {
+  align-items: center;
+  border-radius: 3px;
+  display: inline-flex;
+  font-size: 0.68rem;
+  gap: 0.3rem;
+  min-height: 1.9rem;
+  padding: 0.3rem 0.55rem;
+  text-transform: uppercase;
+}
+
+.pending-request-item__accept {
+  background: rgba(138, 247, 211, 0.12);
+  border-color: rgba(138, 247, 211, 0.6);
+  color: var(--accent-2);
+}
+
+.pending-request-item__decline {
+  background: rgba(255, 92, 122, 0.1);
+  border-color: rgba(255, 92, 122, 0.55);
+  color: var(--danger);
+}
+
 /* ── Room Code Display ─────────────────────────────────────────────────────── */
 .room-code-display {
   background: rgba(55, 243, 255, 0.04);

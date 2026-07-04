@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   AudioLines,
+  Check,
   CircleDot,
   Clipboard,
   FileVideo,
@@ -19,6 +20,7 @@ import {
   Shield,
   Signal,
   Upload,
+  UserPlus,
   Video,
   X
 } from "lucide-react";
@@ -259,6 +261,17 @@ function writeStoredRtcConfig(config: ShareRtcConfig | null) {
   localStorage.setItem("syncplayer:rtcconfig", JSON.stringify(config));
 }
 
+// Off by default: connecting peers wait for explicit host approval unless
+// the host opts into auto-accepting everyone. Persisted so a host's choice
+// survives a page refresh.
+function readStoredAllowAllConnections(): boolean {
+  try {
+    return localStorage.getItem("syncplayer:allowallconnections") === "true";
+  } catch {
+    return false;
+  }
+}
+
 function createRemoteMedia(url: string): LoadedMedia {
   const parsedUrl = new URL(url);
   const format = inferMediaFormat(url);
@@ -339,6 +352,15 @@ export function App() {
   const [joinCode, setJoinCode] = useState("");
   const [openedThroughRoomLink, setOpenedThroughRoomLink] = useState(false);
   const [showQr, setShowQr] = useState(false);
+  // Host preference: off by default, so a guessed/brute-forced room code
+  // alone can't get anyone in — every connection waits for explicit approval
+  // unless the host opts into auto-accepting everyone.
+  const [allowAllConnections, setAllowAllConnections] = useState(readStoredAllowAllConnections);
+  useEffect(() => {
+    try {
+      localStorage.setItem("syncplayer:allowallconnections", String(allowAllConnections));
+    } catch { /* ignore */ }
+  }, [allowAllConnections]);
   const staleBlobUrlRef = useRef<string | null>(null);
   const guestFileRef = useRef<File | null>(null);
   const opfsFileHandleRef = useRef<FileSystemFileHandle | null>(null);
@@ -745,7 +767,8 @@ export function App() {
     onConfigRequest: handleConfigRequest,
     onConfigState: handleConfigState,
     onConfigChanged: handleConfigChanged,
-    onGuestAction: handleGuestAction
+    onGuestAction: handleGuestAction,
+    allowAllConnections
   });
 
   useEffect(() => {
@@ -1668,6 +1691,45 @@ export function App() {
             </button>
           </div>
         </div>
+      ) : room.role === "guest" && room.status === "awaiting-approval" ? (
+        <div className="status-band status-band--warn">
+          <div className="status-band__content">
+            <div className="status-band__icon status-band__icon--pulse">
+              <Lock size={18} />
+            </div>
+            <div className="status-band__text-group">
+              <span className="status-band__title">Waiting for Host Approval</span>
+              <span className="status-band__desc">
+                Connected to Host room <strong>{formatRoomId(room.localOffer)}</strong>, but the host has approval required for new
+                viewers. Sit tight — you'll join automatically once they accept.
+              </span>
+            </div>
+          </div>
+          <div className="status-band__actions">
+            <button type="button" className="status-band__btn" onClick={room.closeRoom}>
+              Cancel Join
+            </button>
+          </div>
+        </div>
+      ) : room.role === "guest" && room.status === "declined" ? (
+        <div className="status-band status-band--error">
+          <div className="status-band__content">
+            <div className="status-band__icon">
+              <AlertTriangle size={18} />
+            </div>
+            <div className="status-band__text-group">
+              <span className="status-band__title">Join Request Declined</span>
+              <span className="status-band__desc">
+                The host declined your request to join room <strong>{formatRoomId(room.localOffer)}</strong>.
+              </span>
+            </div>
+          </div>
+          <div className="status-band__actions">
+            <button type="button" className="status-band__btn" onClick={room.closeRoom}>
+              Dismiss
+            </button>
+          </div>
+        </div>
       ) : room.role === "guest" && room.status === "failed" ? (
         <div className="status-band status-band--error">
           <div className="status-band__content">
@@ -1895,6 +1957,37 @@ export function App() {
               </p>
             </div>
 
+            {room.role !== "guest" && (
+              <label className="allow-all-toggle">
+                <input
+                  type="checkbox"
+                  checked={allowAllConnections}
+                  onChange={(event) => {
+                    const next = event.target.checked;
+                    setAllowAllConnections(next);
+                    log(
+                      next ? "warn" : "ok",
+                      "ROOM",
+                      next
+                        ? "Allow all connections enabled — anyone with the room code or link joins instantly, no approval needed."
+                        : "Allow all connections disabled — new connections now require your approval."
+                    );
+                  }}
+                />
+                <span className="allow-all-toggle__track">
+                  <span className="allow-all-toggle__thumb" />
+                </span>
+                <span className="allow-all-toggle__copy">
+                  <strong>Allow all connections</strong>
+                  <span>
+                    {allowAllConnections
+                      ? "Anyone with the code or link joins instantly."
+                      : "New viewers need your approval before they join."}
+                  </span>
+                </span>
+              </label>
+            )}
+
             <div className="share-flow">
               {room.role === "host" && inviteLink ? (
                 <button type="button" className="primary-action" onClick={() => { copyText(inviteLink); log("ok", "SHARE", "Invite link copied to clipboard."); }}>
@@ -1979,6 +2072,48 @@ export function App() {
                     Join
                   </button>
                 </div>
+              </div>
+            )}
+
+            {/* Pending join requests — only ever populated when "allow all
+                connections" is off. Each one needs an explicit decision. */}
+            {room.role === "host" && room.pendingRequests.length > 0 && (
+              <div className="pending-requests">
+                <span className="section-title">
+                  <UserPlus size={11} />
+                  Join Requests ({room.pendingRequests.length})
+                </span>
+                <ul className="pending-request-list">
+                  {room.pendingRequests.map((request) => (
+                    <li key={request.peerId} className="pending-request-item">
+                      <span className="pending-request-item__label">{request.label}</span>
+                      <div className="pending-request-item__actions">
+                        <button
+                          type="button"
+                          className="pending-request-item__accept"
+                          onClick={() => {
+                            room.respondToJoinRequest(request.peerId, true);
+                            log("ok", "ROOM", `Accepted join request from ${request.label}.`);
+                          }}
+                        >
+                          <Check size={13} />
+                          Accept
+                        </button>
+                        <button
+                          type="button"
+                          className="pending-request-item__decline"
+                          onClick={() => {
+                            room.respondToJoinRequest(request.peerId, false);
+                            log("warn", "ROOM", `Declined join request from ${request.label}.`);
+                          }}
+                        >
+                          <X size={13} />
+                          Decline
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
               </div>
             )}
 

@@ -6,7 +6,11 @@ import { smoothLatencySync } from "@/lib/wasm/syncCore";
 import { combineChecksums, rangesInclude } from "@/lib/media/checksum";
 
 type RoomRole = "solo" | "host" | "guest";
-type LinkStatus = "idle" | "pairing" | "connected" | "disconnected" | "failed";
+// "awaiting-approval": the WebRTC channel is open but the host hasn't decided
+// yet (only reachable when the host has "allow all connections" off).
+// "declined": the host explicitly rejected the join request — terminal,
+// does not trigger the guest's auto-reconnect logic.
+type LinkStatus = "idle" | "pairing" | "awaiting-approval" | "connected" | "disconnected" | "failed" | "declined";
 type ExtendedRTCConfiguration = RTCConfiguration & { sdpSemantics?: "unified-plan" };
 type StoredPeerOptions = PeerJSOption & { config?: ExtendedRTCConfiguration };
 
@@ -48,6 +52,13 @@ export type FileReceiveProgress = {
   totalBytes: number;
 };
 
+/** Host-side: a connection awaiting an explicit accept/decline decision. */
+export type PendingJoinRequest = {
+  peerId: string;
+  label: string;
+  requestedAt: number;
+};
+
 type PeerRoomOptions = {
   onPlaybackState: (snapshot: PlaybackSnapshot, latencyMs: number) => void;
   onEvent: (level: "info" | "ok" | "warn" | "error", label: string, detail: string) => void;
@@ -58,6 +69,14 @@ type PeerRoomOptions = {
   onConfigChanged?: () => void;
   /** Host-side: a viewer performed a rate-limited pause/resume/seek and it passed the host's own limit check. */
   onGuestAction?: (action: GuestPlaybackAction, snapshot: PlaybackSnapshot, peerId: string) => void;
+  /**
+   * Host-side: when true, incoming connections are accepted immediately
+   * (today's behavior). When false (the default), a connecting peer sits in
+   * a pending queue until the host explicitly accepts or declines it — so
+   * guessing or brute-forcing the room code no longer gets anyone in on its
+   * own.
+   */
+  allowAllConnections: boolean;
 };
 
 function readStoredPeerOptions() {
@@ -258,6 +277,11 @@ const RESUME_ACK_TIMEOUT_MS = 500;
 // it to a cadence that's still responsive enough for a progress bar.
 const PROGRESS_ECHO_INTERVAL_MS = 250;
 
+// ─── Connection approval ───────────────────────────────────────────────────────
+// If the host never responds to a join request, auto-decline it after this
+// long so it doesn't sit open and cluttering the UI indefinitely.
+const PENDING_REQUEST_TIMEOUT_MS = 2 * 60 * 1000;
+
 function getDataChannel(conn: DataConnection) {
   return conn.dataChannel ?? (conn as unknown as { _dc?: RTCDataChannel })._dc ?? null;
 }
@@ -289,7 +313,7 @@ function genRoomCode(): string {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
-export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged, onGuestAction }: PeerRoomOptions) {
+export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged, onGuestAction, allowAllConnections }: PeerRoomOptions) {
   const [role, setRole] = useState<RoomRole>("solo");
   const [status, setStatus] = useState<LinkStatus>("idle");
   const [localOffer, setLocalOffer] = useState("");
@@ -300,6 +324,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const [fileReceiveProgress, setFileReceiveProgress] = useState<FileReceiveProgress | null>(null);
   // Host-side: each connected viewer's own reported receive progress, keyed by peer ID.
   const [peerFileProgress, setPeerFileProgress] = useState<Record<string, PeerFileProgress>>({});
+  // Host-side: connections awaiting an explicit accept/decline decision.
+  const [pendingRequests, setPendingRequests] = useState<PendingJoinRequest[]>([]);
 
   const peerId = useMemo(() => `SP-${genRoomCode()}`, []);
 
@@ -313,6 +339,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const onConfigStateRef = useRef(onConfigState);
   const onConfigChangedRef = useRef(onConfigChanged);
   const onGuestActionRef = useRef(onGuestAction);
+  const allowAllConnectionsRef = useRef(allowAllConnections);
+  // role changes rarely, but handleMessage's closure is long-lived (bound to
+  // DataConnection listeners at connect-time), so it needs a ref rather than
+  // reading `role` directly to avoid a stale value.
+  const roleRef = useRef(role);
   useEffect(() => {
     onPlaybackStateRef.current = onPlaybackState;
     onEventRef.current = onEvent;
@@ -322,7 +353,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     onConfigStateRef.current = onConfigState;
     onConfigChangedRef.current = onConfigChanged;
     onGuestActionRef.current = onGuestAction;
-  }, [onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged, onGuestAction]);
+    allowAllConnectionsRef.current = allowAllConnections;
+  }, [onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged, onGuestAction, allowAllConnections]);
+  useEffect(() => {
+    roleRef.current = role;
+  }, [role]);
 
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<DataConnection[]>([]);
@@ -346,6 +381,18 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   // Guards against two overlapping sendFile() calls fighting over the same
   // connections (e.g. host swaps files while a previous transfer is still draining).
   const activeSendGenerationRef = useRef(0);
+
+  // Host-side connection-approval bookkeeping (see peer.on("connection") below).
+  // Channels awaiting a decision, grouped by peer ID — a guest opens several
+  // multiplexed channels, all belonging to the same approve/decline decision.
+  const pendingConnectionsRef = useRef<Map<string, DataConnection[]>>(new Map());
+  // Once a peer's been decided, remember it so any of their channels that are
+  // still mid-handshake when the decision is made get the same treatment.
+  const peerDecisionRef = useRef<Map<string, "accepted" | "declined">>(new Map());
+  // Auto-decline a pending request if the host never responds. Typed as
+  // `number` (not ReturnType<typeof setTimeout>) since @types/node's Timeout
+  // type would otherwise shadow the DOM's window.setTimeout return type here.
+  const pendingTimeoutsRef = useRef<Map<string, number>>(new Map());
 
   const closeRoom = useCallback(() => {
     onEventRef.current("info", "ROOM", "Initiating room closure. Terminating all peer connections.");
@@ -375,6 +422,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     resumeInfoRef.current.clear();
     resumeWaitersRef.current.clear();
     activeSendGenerationRef.current += 1;
+    pendingConnectionsRef.current.clear();
+    peerDecisionRef.current.clear();
+    pendingTimeoutsRef.current.forEach((timeout) => window.clearTimeout(timeout));
+    pendingTimeoutsRef.current.clear();
+    setPendingRequests([]);
   }, []);
 
   useEffect(() => {
@@ -472,6 +524,22 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
           prev === "Awaiting peer" ? message.payload.label : prev.includes(message.payload.label) ? prev : `${prev}, ${message.payload.label}`
         );
         onEventRef.current("ok", "PEER LINK", `${message.payload.label} (${conn.peer}) handshake complete.`);
+
+        // Guest-side: this is the host's explicit sign of acceptance (it's
+        // only ever sent once a connection is actually approved — see
+        // peer.on("connection") below). The host doesn't need this signal;
+        // it already knows it accepted the connection itself, and blindly
+        // overwriting connectedPeers here would wipe out its other viewers.
+        if (roleRef.current === "guest") {
+          setStatus("connected");
+          setConnectedPeers([conn.peer]);
+        }
+        return;
+      }
+
+      if (message.type === "room.joinDeclined") {
+        setStatus("declined");
+        onEventRef.current("error", "ROOM", "The host declined your join request.");
         return;
       }
 
@@ -992,6 +1060,67 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     [sendToOne]
   );
 
+  /** Fully accept a connection (whether auto-approved or manually approved): wire it up and welcome it in. */
+  const acceptConnection = useCallback(
+    (conn: DataConnection) => {
+      connectionsRef.current.push(conn);
+      setConnectedPeers((prev) => (prev.includes(conn.peer) ? prev : [...prev, conn.peer]));
+      setStatus("connected");
+      onEventRef.current("ok", "WEBRTC", `Connection established with ${conn.peer}. ICE success.`);
+
+      conn.on("data", (data) => { handleMessage(conn, data); });
+
+      conn.send({
+        id: crypto.randomUUID(),
+        type: "room.hello",
+        sentAt: performance.now(),
+        payload: { peerId, label: `Host (${peerId.slice(3, 7)})` }
+      });
+    },
+    [handleMessage, peerId]
+  );
+
+  /** Reject a connection: let the guest know why, then close it. */
+  const declineConnection = useCallback((conn: DataConnection) => {
+    onEventRef.current("warn", "WEBRTC", `Declined connection from ${conn.peer}.`);
+    if (conn.open) {
+      conn.send({
+        id: crypto.randomUUID(),
+        type: "room.joinDeclined",
+        sentAt: performance.now(),
+        payload: {}
+      });
+    }
+    // Give the decline message a moment to actually go out over the data
+    // channel before tearing the connection down.
+    window.setTimeout(() => conn.close(), 250);
+  }, []);
+
+  /** Host-side: accept or decline a pending join request, applying the decision to all of that peer's queued channels. */
+  const respondToJoinRequest = useCallback(
+    (requestPeerId: string, accept: boolean) => {
+      const timeout = pendingTimeoutsRef.current.get(requestPeerId);
+      if (timeout) {
+        window.clearTimeout(timeout);
+        pendingTimeoutsRef.current.delete(requestPeerId);
+      }
+
+      const conns = pendingConnectionsRef.current.get(requestPeerId) ?? [];
+      pendingConnectionsRef.current.delete(requestPeerId);
+      peerDecisionRef.current.set(requestPeerId, accept ? "accepted" : "declined");
+      setPendingRequests((prev) => prev.filter((r) => r.peerId !== requestPeerId));
+
+      conns.forEach((conn) => {
+        if (accept) {
+          acceptConnection(conn);
+        } else {
+          declineConnection(conn);
+        }
+      });
+    },
+    [acceptConnection, declineConnection]
+  );
+
   const createHostOffer = useCallback(async () => {
     closeRoom();
     setRole("host");
@@ -1012,20 +1141,40 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       setupConnectionDiagnostics(conn, `Viewer ${conn.peer}`, onEventRef.current);
 
       conn.on("open", () => {
-        connectionsRef.current.push(conn);
-        setConnectedPeers((prev) => prev.includes(conn.peer) ? prev : [...prev, conn.peer]);
-        setStatus("connected");
-        onEventRef.current("ok", "WEBRTC", `Connection established with ${conn.peer}. ICE success.`);
+        // A peer that's already been decided (e.g. one of its later
+        // multiplexed channels finishing handshake after the host already
+        // acted on an earlier channel) gets the same treatment immediately.
+        const decision = peerDecisionRef.current.get(conn.peer);
 
-        conn.send({
-          id: crypto.randomUUID(),
-          type: "room.hello",
-          sentAt: performance.now(),
-          payload: { peerId, label: `Host (${peerId.slice(3, 7)})` }
-        });
+        if (decision === "accepted" || (!decision && allowAllConnectionsRef.current)) {
+          acceptConnection(conn);
+          return;
+        }
+
+        if (decision === "declined") {
+          declineConnection(conn);
+          return;
+        }
+
+        // No decision yet — queue this channel. If it's the first one from
+        // this peer, surface a pending request for the host to act on.
+        const existing = pendingConnectionsRef.current.get(conn.peer);
+        if (existing) {
+          existing.push(conn);
+          return;
+        }
+
+        pendingConnectionsRef.current.set(conn.peer, [conn]);
+        const label = conn.peer.startsWith("SP-GUEST") ? `Viewer (${conn.peer.slice(9)})` : conn.peer;
+        setPendingRequests((prev) => [...prev, { peerId: conn.peer, label, requestedAt: Date.now() }]);
+        onEventRef.current("info", "ROOM", `Join request from ${label} (${conn.peer}) — awaiting your approval.`);
+
+        const timeout = window.setTimeout(() => {
+          onEventRef.current("warn", "ROOM", `Join request from ${label} timed out without a response and was declined.`);
+          respondToJoinRequest(conn.peer, false);
+        }, PENDING_REQUEST_TIMEOUT_MS);
+        pendingTimeoutsRef.current.set(conn.peer, timeout);
       });
-
-      conn.on("data", (data) => { handleMessage(conn, data); });
 
       conn.on("iceStateChanged", (state) => {
         const level = state === "failed" ? "error" : state === "disconnected" ? "warn" : "info";
@@ -1033,6 +1182,26 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       });
 
       conn.on("close", () => {
+        // If this channel never got a decision (guest gave up, or the
+        // connection dropped while still pending), clean up its pending
+        // bookkeeping too — it wouldn't otherwise be caught below since it
+        // never made it into connectionsRef.
+        const pendingForPeer = pendingConnectionsRef.current.get(conn.peer);
+        if (pendingForPeer) {
+          const remaining = pendingForPeer.filter((c) => c !== conn);
+          if (remaining.length > 0) {
+            pendingConnectionsRef.current.set(conn.peer, remaining);
+          } else {
+            pendingConnectionsRef.current.delete(conn.peer);
+            setPendingRequests((prev) => prev.filter((r) => r.peerId !== conn.peer));
+            const timeout = pendingTimeoutsRef.current.get(conn.peer);
+            if (timeout) {
+              window.clearTimeout(timeout);
+              pendingTimeoutsRef.current.delete(conn.peer);
+            }
+          }
+        }
+
         connectionsRef.current = connectionsRef.current.filter((c) => c !== conn);
         setConnectedPeers((prev) => prev.filter((id) => id !== conn.peer));
         onEventRef.current("warn", "WEBRTC", `Viewer ${conn.peer} disconnected.`);
@@ -1043,6 +1212,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
           guestActionHistoryRef.current.delete(conn.peer);
           resumeInfoRef.current.delete(conn.peer);
           resumeWaitersRef.current.delete(conn.peer);
+          peerDecisionRef.current.delete(conn.peer);
           setPeerFileProgress((prev) => {
             if (!(conn.peer in prev)) return prev;
             const next = { ...prev };
@@ -1075,7 +1245,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     }
 
     return peerId;
-  }, [closeRoom, handleMessage, peerId]);
+  }, [closeRoom, handleMessage, peerId, acceptConnection, declineConnection, respondToJoinRequest]);
 
   const joinWithOffer = useCallback(
     async (rawId: string) => {
@@ -1130,9 +1300,13 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
 
               connectionsRef.current.push(conn);
               if (i === 0) {
-                setConnectedPeers([hostId]);
-                setStatus("connected");
-                onEventRef.current("ok", "WEBRTC", `Joined room. Multiplexed data channels open with host.`);
+                // The WebRTC channel is open, but the host may have "allow
+                // all connections" off and be holding this pending — don't
+                // claim "connected" yet. The host's room.hello (only ever
+                // sent once a connection is actually accepted) is what
+                // flips this to "connected", handled in handleMessage.
+                setStatus("awaiting-approval");
+                onEventRef.current("ok", "WEBRTC", `Data channel open with host. Awaiting host approval...`);
               }
 
               conn.send({
@@ -1156,7 +1330,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
               connectionsRef.current = connectionsRef.current.filter((c) => c !== conn);
               if (connectionsRef.current.length === 0) {
                 setConnectedPeers([]);
-                setStatus("disconnected");
+                // Don't clobber a "declined" state — the host closes the
+                // connection right after declining, and this event can
+                // easily fire before/around the same tick as the
+                // room.joinDeclined message being processed.
+                setStatus((prev) => (prev === "declined" ? prev : "disconnected"));
                 setRemotePeer("Awaiting peer");
                 onEventRef.current("warn", "WEBRTC", `Host (${hostId}) disconnected.`);
               }
@@ -1216,6 +1394,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     fileSendProgress,
     fileReceiveProgress,
     peerFileProgress,
+    pendingRequests,
+    respondToJoinRequest,
     createHostOffer,
     joinWithOffer,
     closeRoom,
