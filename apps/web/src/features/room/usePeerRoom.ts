@@ -4,6 +4,7 @@ import type { PlaybackSnapshot, WireMessage, FileMeta, RemoteMediaMount, Playbac
 import { CHUNK_SIZE } from "@/lib/webrtc/messages";
 import { smoothLatencySync } from "@/lib/wasm/syncCore";
 import { combineChecksums, rangesInclude } from "@/lib/media/checksum";
+import { getQueuedChunkCount } from "@/lib/webrtc/peerjsCompat";
 
 type RoomRole = "solo" | "host" | "guest";
 // "awaiting-approval": the WebRTC channel is open but the host hasn't decided
@@ -118,12 +119,18 @@ function createRtcConfig(relayOnly = false): ExtendedRTCConfiguration {
   };
 }
 
+// PeerJS's own internal logger levels: 0=none, 1=errors, 2=+warnings, 3=+verbose trace.
+// Level 2 surfaces its warn/error console output (useful when a user reports
+// a WebRTC issue we can't otherwise see) without the noisy level-3 trace.
+// This is separate from — and in addition to — our own onEvent activity log.
+const PEERJS_LOG_LEVEL = 2;
+
 function createPeer(peerId: string, relayOnly = false) {
   const serverConfig = getPeerServerConfig();
   return new Peer(peerId, {
     ...serverConfig,
     config: createRtcConfig(relayOnly),
-    debug: 2
+    debug: PEERJS_LOG_LEVEL
   });
 }
 
@@ -282,15 +289,11 @@ const PROGRESS_ECHO_INTERVAL_MS = 250;
 // long so it doesn't sit open and cluttering the UI indefinitely.
 const PENDING_REQUEST_TIMEOUT_MS = 2 * 60 * 1000;
 
-function getDataChannel(conn: DataConnection) {
-  return conn.dataChannel ?? (conn as unknown as { _dc?: RTCDataChannel })._dc ?? null;
-}
-
 /** Wait until conn's bufferedAmount drops below the low watermark. */
 function waitForDrain(conn: DataConnection): Promise<void> {
   return new Promise((resolve) => {
-    const channel = getDataChannel(conn);
-    const peerBufferSize = (conn as unknown as { bufferSize?: number }).bufferSize ?? 0;
+    const channel = conn.dataChannel ?? null;
+    const peerBufferSize = getQueuedChunkCount(conn);
     if (!channel || (channel.bufferedAmount < FLOW_LOW_WATERMARK && peerBufferSize === 0)) {
       resolve();
       return;
@@ -299,7 +302,7 @@ function waitForDrain(conn: DataConnection): Promise<void> {
     channel.bufferedAmountLowThreshold = FLOW_LOW_WATERMARK;
     const interval = setInterval(() => {
       const buffered = channel.bufferedAmount;
-      const queued = (conn as unknown as { bufferSize?: number }).bufferSize ?? 0;
+      const queued = getQueuedChunkCount(conn);
       if (buffered < FLOW_LOW_WATERMARK && queued === 0) {
         clearInterval(interval);
         resolve();
@@ -945,7 +948,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
                 let conn = openConns[cIdx % openConns.length];
                 peerConnIndex.set(peerId, cIdx + 1);
 
-                const channel = getDataChannel(conn);
+                const channel = conn.dataChannel ?? null;
                 if (channel && channel.bufferedAmount > FLOW_HIGH_WATERMARK) {
                   await waitForDrain(conn);
                 }
