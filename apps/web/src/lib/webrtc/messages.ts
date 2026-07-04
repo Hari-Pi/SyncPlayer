@@ -120,4 +120,15 @@ export type WireMessage =
       type: "config.changed";
       sentAt: number;
       payload: Record<string, never>;
+    }
+  | {
+      id: string;
+      type: "sync.health";
+      sentAt: number;
+      payload: {
+        /** true if the reporting peer's media element is currently starved for data. */
+        stalled: boolean;
+        /** seconds of buffered media ahead of the reporting peer's current playback position. */
+        bufferedAheadSecs: number;
+      };
     };

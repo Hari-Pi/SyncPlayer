@@ -53,16 +53,50 @@ const DRIFT_FIRM_MS = 500;
 const SOFT_RATE = 0.05;
 const FIRM_RATE = 0.1;
 
+// A guest that's behind the host and needs to speed up to catch back
+// up will burn through its buffer faster — if the buffer ahead is already
+// thin, that's exactly what causes a stall, which then triggers another
+// correction (the "endless catching" problem). Below this many seconds of
+// buffer ahead, we hold instead of speeding up and let the buffer refill.
+const MIN_SAFE_BUFFER_SECS = 1.5;
+
+// After a hard seek, give the player time to actually rebuffer before
+// allowing another seek. Otherwise a slow connection sees seek → stall →
+// new correction arrives → seek again, without ever settling.
+const SEEK_COOLDOWN_MS = 1500;
+
+// Smooth drift over a short rolling window so a single noisy sample
+// (e.g. a late/jittery message) doesn't trigger an aggressive correction.
+const DRIFT_SMOOTHING_SAMPLES = 3;
+
+/** Seconds of buffered media ahead of the element's current playback position. */
+function getBufferedAheadSecs(element: HTMLMediaElement): number {
+  const { buffered, currentTime } = element;
+  for (let i = 0; i < buffered.length; i++) {
+    if (buffered.start(i) <= currentTime && currentTime <= buffered.end(i)) {
+      return buffered.end(i) - currentTime;
+    }
+  }
+  return 0;
+}
+
 // Compute a DriftReading from the signed offset between local currentTime and
 // the remote target position (both in seconds). Returns the correction
 // multiplier relative to the host rate — applied to guests each tick.
-function readDrift(driftSecs: number, hostRate: number): DriftReading {
+function readDrift(driftSecs: number, hostRate: number, bufferedAheadSecs: number): DriftReading {
   const driftMs = driftSecs * 1000;
   const abs = Math.abs(driftMs);
 
   if (abs < DRIFT_HOLD_MS) {
     return { driftMs, mode: "hold", rate: hostRate };
   }
+
+  // Negative drift means we're behind the target and would need to speed up.
+  const needsSpeedUp = driftMs < 0;
+  if (needsSpeedUp && bufferedAheadSecs < MIN_SAFE_BUFFER_SECS && abs < DRIFT_FIRM_MS) {
+    return { driftMs, mode: "hold", rate: hostRate };
+  }
+
   if (abs < DRIFT_SOFT_MS) {
     return { driftMs, mode: "soft", rate: hostRate * (driftMs > 0 ? 1 - SOFT_RATE : 1 + SOFT_RATE) };
   }
@@ -250,6 +284,12 @@ export function App() {
   const dashRef = useRef<any>(null);
   const remoteApplyRef = useRef(false);
   const lastBroadcastRef = useRef(0);
+  // Rolling window of recent drift samples (secs) for smoothing corrections.
+  const driftHistoryRef = useRef<number[]>([]);
+  // Timestamp (performance.now()) of the last hard seek correction we applied.
+  const lastSeekAtRef = useRef(0);
+  // True while the local media element is stalled waiting for data.
+  const isStalledRef = useRef(false);
   const [clock, setClock] = useState(formatClock());
   const [media, setMedia] = useState<LoadedMedia | null>(null);
   // Keep a ref to the live media so async callbacks always see the current value,
@@ -319,14 +359,34 @@ export function App() {
 
       // Guests measure real drift and apply correction.
       if (roomRef.current?.role === "guest") {
-        const driftSecs = element.currentTime - targetPosition;
-        const reading = readDrift(driftSecs, remoteSnapshot.playbackRate);
+        const rawDriftSecs = element.currentTime - targetPosition;
+
+        // Smooth over the last few samples so a single noisy reading doesn't
+        // flip the correction mode back and forth.
+        const history = [...driftHistoryRef.current.slice(-(DRIFT_SMOOTHING_SAMPLES - 1)), rawDriftSecs];
+        driftHistoryRef.current = history;
+        const driftSecs = history.reduce((sum, value) => sum + value, 0) / history.length;
+
+        const bufferedAheadSecs = getBufferedAheadSecs(element);
+        const reading = readDrift(driftSecs, remoteSnapshot.playbackRate, bufferedAheadSecs);
         setDrift(reading);
 
         // Graduated drift correction: soft/firm nudge playbackRate, seek for large drift.
         if (reading.mode === "seek") {
-          element.currentTime = targetPosition;
-          element.playbackRate = remoteSnapshot.playbackRate;
+          const now = performance.now();
+          const recovering = isStalledRef.current || now - lastSeekAtRef.current < SEEK_COOLDOWN_MS;
+
+          if (recovering) {
+            // Already mid-stall or mid-recovery from a previous seek — seeking
+            // again now would just restart the buffering instead of letting it
+            // finish. Hold rate and let the current correction settle.
+            element.playbackRate = remoteSnapshot.playbackRate;
+          } else {
+            element.currentTime = targetPosition;
+            element.playbackRate = remoteSnapshot.playbackRate;
+            lastSeekAtRef.current = now;
+            driftHistoryRef.current = [];
+          }
         } else {
           element.playbackRate = reading.rate;
         }
@@ -478,6 +538,9 @@ export function App() {
       setRemoteUrl(url);
       setMedia(nextMedia);
       setDrift(emptyDrift);
+      driftHistoryRef.current = [];
+      lastSeekAtRef.current = 0;
+      isStalledRef.current = false;
       hostFileRef.current = null;
       log("ok", "MEDIA", source === "invite" ? "Media URL loaded from invite link." : `${mediaFormatLabel(nextMedia.format)} URL mounted.`);
       return nextMedia;
@@ -496,6 +559,9 @@ export function App() {
     setRemoteUrl(nextMedia.sourceUrl);
     setMedia(nextMedia);
     setDrift(emptyDrift);
+    driftHistoryRef.current = [];
+    lastSeekAtRef.current = 0;
+    isStalledRef.current = false;
     log("ok", "MEDIA", `${nextMedia.title} mounted from host.`);
   }, [cleanupOpfsFile, log]);
 
@@ -634,6 +700,22 @@ export function App() {
 
     return () => window.clearInterval(timer);
   }, [room]);
+
+  // Guest: report local buffering health once a second so the host can adapt
+  // this peer's broadcast cadence (see usePeerRoom's adaptive interval logic).
+  useEffect(() => {
+    if (room.role !== "guest") {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      const element = mediaRef.current;
+      const bufferedAheadSecs = element ? getBufferedAheadSecs(element) : 0;
+      room.reportSyncHealth(isStalledRef.current, bufferedAheadSecs);
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [room.role, room]);
 
   // Host meter: show measured peer latency (one-way, EWMA-smoothed) in the
   // ring since the host has no upstream position to drift against. Guests
@@ -852,6 +934,9 @@ export function App() {
         modifiedMs: file.lastModified
       });
       setDrift(emptyDrift);
+      driftHistoryRef.current = [];
+      lastSeekAtRef.current = 0;
+      isStalledRef.current = false;
       log("ok", "MEDIA", `${file.name} mounted as local source.`);
 
       // If already hosting a connected room, stream immediately to all peers
@@ -1216,12 +1301,16 @@ export function App() {
       const onSeeked = () => publishSnapshotRef.current(true);
       const onRateChange = () => publishSnapshotRef.current(true);
       const onLoadedMetadata = () => handleLoadedMetadataRef.current();
+      const onWaiting = () => { isStalledRef.current = true; };
+      const onPlaying = () => { isStalledRef.current = false; };
 
       video.addEventListener("play", onPlay);
       video.addEventListener("pause", onPause);
       video.addEventListener("seeked", onSeeked);
       video.addEventListener("ratechange", onRateChange);
       video.addEventListener("loadedmetadata", onLoadedMetadata);
+      video.addEventListener("waiting", onWaiting);
+      video.addEventListener("playing", onPlaying);
 
       if (video.duration) {
         onLoadedMetadata();
@@ -1233,6 +1322,8 @@ export function App() {
         video.removeEventListener("seeked", onSeeked);
         video.removeEventListener("ratechange", onRateChange);
         video.removeEventListener("loadedmetadata", onLoadedMetadata);
+        video.removeEventListener("waiting", onWaiting);
+        video.removeEventListener("playing", onPlaying);
       });
     });
 
@@ -1494,6 +1585,8 @@ export function App() {
                       onSeeked={() => publishSnapshot(true)}
                       onRateChange={() => publishSnapshot(true)}
                       onTimeUpdate={() => publishSnapshot(false)}
+                      onWaiting={() => { isStalledRef.current = true; }}
+                      onPlaying={() => { isStalledRef.current = false; }}
                     />
                   </div>
                 ) : (

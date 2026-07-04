@@ -203,6 +203,22 @@ const FLOW_HIGH_WATERMARK = 4 * 1024 * 1024;
 // Resume when it drains below 256 KB
 const FLOW_LOW_WATERMARK = 256 * 1024;
 
+// ─── Adaptive per-peer playback.state broadcast cadence ──────────────────────
+// A slow/lossy peer will report repeated buffering via "sync.health". Rather
+// than slowing every peer down uniformly, each peer gets its own broadcast
+// interval that steps up on repeated stalls and steps back down once the peer
+// reports healthy for a while.
+const BROADCAST_STEPS_MS = [250, 500, 750, 1000];
+const STALL_ESCALATE_THRESHOLD = 3;
+const HEALTHY_DEESCALATE_THRESHOLD = 8;
+
+type PeerHealthState = {
+  intervalMs: number;
+  lastSentAt: number;
+  stallStreak: number;
+  healthyStreak: number;
+};
+
 function getDataChannel(conn: DataConnection) {
   return conn.dataChannel ?? (conn as unknown as { _dc?: RTCDataChannel })._dc ?? null;
 }
@@ -273,6 +289,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const rttSamplesRef = useRef<number[]>([]);
   // Active FileStreamHandlers keyed by mediaId (guest side)
   const fileStreamHandlersRef = useRef<Map<string, FileStreamHandlers>>(new Map());
+  // Host-side: per-guest-peer adaptive broadcast cadence state, keyed by conn.peer.
+  const peerHealthRef = useRef<Map<string, PeerHealthState>>(new Map());
 
   const closeRoom = useCallback(() => {
     onEventRef.current("info", "ROOM", "Initiating room closure. Terminating all peer connections.");
@@ -296,6 +314,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     setFileSendProgress(null);
     setFileReceiveProgress(null);
     fileStreamHandlersRef.current.clear();
+    peerHealthRef.current.clear();
   }, []);
 
   useEffect(() => {
@@ -327,9 +346,38 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
 
 
 
+  // Broadcasts playback state, but gates each peer independently against its
+  // own adaptive interval (see peerHealthRef) instead of sending to everyone
+  // on a fixed cadence. A peer with no reported health yet uses the fastest
+  // (250ms) interval.
   const sendPlaybackState = useCallback(
-    (snapshot: PlaybackSnapshot) => { send("playback.state", snapshot); },
-    [send]
+    (snapshot: PlaybackSnapshot) => {
+      const conns = connectionsRef.current;
+      if (conns.length === 0) return;
+
+      const now = performance.now();
+      const seenPeers = new Set<string>();
+
+      conns.forEach((conn) => {
+        if (!conn.open || seenPeers.has(conn.peer)) return;
+        seenPeers.add(conn.peer);
+
+        const state = peerHealthRef.current.get(conn.peer);
+        const intervalMs = state?.intervalMs ?? BROADCAST_STEPS_MS[0];
+
+        if (now - (state?.lastSentAt ?? 0) < intervalMs) return;
+
+        sendToOne(conn, "playback.state", snapshot);
+
+        peerHealthRef.current.set(conn.peer, {
+          intervalMs,
+          lastSentAt: now,
+          stallStreak: state?.stallStreak ?? 0,
+          healthyStreak: state?.healthyStreak ?? 0
+        });
+      });
+    },
+    [sendToOne]
   );
 
   const sendMediaMount = useCallback(
@@ -463,8 +511,61 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         onConfigChangedRef.current?.();
         return;
       }
+
+      if (message.type === "sync.health") {
+        // Host-side only: adapt this peer's broadcast cadence based on whether
+        // it's reporting buffering. Escalate after repeated stalls, and step
+        // back down once the peer has been healthy for a while so a peer whose
+        // network recovers isn't stuck on a slow cadence forever.
+        const peerKey = conn.peer;
+        const state: PeerHealthState = peerHealthRef.current.get(peerKey) ?? {
+          intervalMs: BROADCAST_STEPS_MS[0],
+          lastSentAt: 0,
+          stallStreak: 0,
+          healthyStreak: 0
+        };
+
+        if (message.payload.stalled) {
+          state.stallStreak += 1;
+          state.healthyStreak = 0;
+
+          if (state.stallStreak >= STALL_ESCALATE_THRESHOLD) {
+            const idx = BROADCAST_STEPS_MS.indexOf(state.intervalMs);
+            const nextMs = BROADCAST_STEPS_MS[Math.min(idx + 1, BROADCAST_STEPS_MS.length - 1)];
+            if (nextMs !== state.intervalMs) {
+              state.intervalMs = nextMs;
+              onEventRef.current("warn", "SYNC", `${peerKey}: repeated buffering reported, backing off broadcast cadence to ${nextMs}ms.`);
+            }
+            state.stallStreak = 0;
+          }
+        } else {
+          state.healthyStreak += 1;
+          state.stallStreak = 0;
+
+          if (state.healthyStreak >= HEALTHY_DEESCALATE_THRESHOLD) {
+            const idx = BROADCAST_STEPS_MS.indexOf(state.intervalMs);
+            const prevMs = BROADCAST_STEPS_MS[Math.max(idx - 1, 0)];
+            if (prevMs !== state.intervalMs) {
+              state.intervalMs = prevMs;
+              onEventRef.current("info", "SYNC", `${peerKey}: connection stable, tightening broadcast cadence to ${prevMs}ms.`);
+            }
+            state.healthyStreak = 0;
+          }
+        }
+
+        peerHealthRef.current.set(peerKey, state);
+        return;
+      }
     },
     [sendToOne]
+  );
+
+  /** Guest-side: report local buffering health to the host so it can adapt cadence. */
+  const reportSyncHealth = useCallback(
+    (stalled: boolean, bufferedAheadSecs: number) => {
+      send("sync.health", { stalled, bufferedAheadSecs });
+    },
+    [send]
   );
 
   /**
@@ -692,6 +793,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         connectionsRef.current = connectionsRef.current.filter((c) => c !== conn);
         setConnectedPeers((prev) => prev.filter((id) => id !== conn.peer));
         onEventRef.current("warn", "WEBRTC", `Viewer ${conn.peer} disconnected.`);
+        if (!connectionsRef.current.some((c) => c.peer === conn.peer)) {
+          // Last channel for this peer closed — drop its adaptive cadence state
+          // so a future rejoin starts fresh at the fastest interval.
+          peerHealthRef.current.delete(conn.peer);
+        }
         if (connectionsRef.current.length === 0) {
           setStatus("disconnected");
           setRemotePeer("Awaiting peer");
@@ -866,6 +972,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     sendConfigRequest,
     sendConfigState,
     broadcastConfigChanged,
+    reportSyncHealth,
     sendFile
   };
 }
