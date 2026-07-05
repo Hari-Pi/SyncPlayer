@@ -80,6 +80,13 @@ const DRIFT_SMOOTHING_SAMPLES = 3;
 const PROGRAMMATIC_SEEK_MATCH_TOLERANCE_SECS = 0.75;
 const PROGRAMMATIC_SEEK_MAX_AGE_MS = 5000;
 
+// How long a viewer's own local pause/resume choice is protected against
+// being overridden by a stale "still playing"/"still paused" snapshot that
+// was already in flight before the host adopted and re-broadcast it. Needs
+// to comfortably cover one full round trip even at the slowest adaptive
+// broadcast cadence (up to 1000ms) plus normal latency.
+const LOCAL_PAUSE_INTENT_GRACE_MS = 2000;
+
 // Viewers can pause/seek and reverse-sync that to the host; the two share one
 // budget per rolling window so a viewer can't spam controls and annoy the
 // rest of the room. Resume is exempt (see handlePlaybackAction). The host
@@ -384,6 +391,16 @@ export function App() {
   // position against this tracked target (rather than relying on elapsed
   // time) disambiguates correctly regardless of how long the seek took.
   const lastProgrammaticSeekRef = useRef<{ target: number; setAt: number } | null>(null);
+  // Guest-side: the paused/playing state the viewer just chose locally (via
+  // click or hotkey), and when. A viewer's own pause/resume must win locally
+  // no matter what — but the host doesn't know about it yet for at least one
+  // round trip (forward the action, host adopts it, host's next broadcast
+  // reflects it back). Any "still playing"/"still paused" snapshot that
+  // arrives from BEFORE the host caught up would otherwise look like a
+  // mismatch to correct, silently reverting the exact action the viewer just
+  // took. This tracks that recent local choice so we can hold off on
+  // correcting against it for a short grace window instead.
+  const localPauseIntentRef = useRef<{ paused: boolean; setAt: number } | null>(null);
   // Guest-side: rolling timestamps of accepted control actions (pause/resume/seek
   // share one budget), used for the client-side rate-limit gate.
   const guestActionHistoryRef = useRef<number[]>([]);
@@ -565,6 +582,23 @@ export function App() {
       // looked like pause "didn't work" until the host changed state and a
       // correction came through some other way.
       if (remoteSnapshot.paused !== element.paused) {
+        const intent = localPauseIntentRef.current;
+        const withinGrace = !!intent && performance.now() - intent.setAt < LOCAL_PAUSE_INTENT_GRACE_MS;
+
+        if (withinGrace && remoteSnapshot.paused !== intent.paused) {
+          // This snapshot contradicts a pause/resume the viewer chose only
+          // moments ago — almost certainly a broadcast that was already in
+          // flight before the host adopted that action, not a genuine new
+          // instruction. Hold the viewer's own choice and wait for the
+          // confirming broadcast instead of immediately reverting them.
+          return;
+        }
+
+        if (intent && remoteSnapshot.paused === intent.paused) {
+          // Confirmed — the host has caught up to what we chose locally.
+          localPauseIntentRef.current = null;
+        }
+
         remoteApplyRef.current = true;
 
         if (remoteSnapshot.paused) {
@@ -578,6 +612,10 @@ export function App() {
         window.setTimeout(() => {
           remoteApplyRef.current = false;
         }, 250);
+      } else if (localPauseIntentRef.current && remoteSnapshot.paused === localPauseIntentRef.current.paused) {
+        // Already matches (no correction needed) and confirms our own recent
+        // choice — clear the guard now rather than waiting out the timeout.
+        localPauseIntentRef.current = null;
       }
     },
     [log] // stable: reads live media via mediaStateRef, not the closed-over state
@@ -798,6 +836,7 @@ export function App() {
       lastSeekAtRef.current = 0;
       isStalledRef.current = false;
       lastProgrammaticSeekRef.current = null;
+      localPauseIntentRef.current = null;
       lastPlayerErrorRef.current = null;
       setPlayerLoadError(null);
       hostFileRef.current = null;
@@ -822,6 +861,7 @@ export function App() {
     lastSeekAtRef.current = 0;
     isStalledRef.current = false;
     lastProgrammaticSeekRef.current = null;
+    localPauseIntentRef.current = null;
     lastPlayerErrorRef.current = null;
     setPlayerLoadError(null);
     log("ok", "MEDIA", `${nextMedia.title} mounted from host.`);
@@ -937,6 +977,33 @@ export function App() {
     await room.joinWithOffer(code);
   }, [joinCode, room, log]);
 
+  // Shared by the host's "start room" flow and the guest auto-generation
+  // effect below — both just need to turn a known offer (host peer ID) into
+  // a shareable URL, without either one needing to (re)negotiate a connection.
+  const buildInviteLink = useCallback(
+    (offer: string) => {
+      const shareableMedia: ShareMedia | null =
+        media?.origin === "remote-url"
+          ? {
+            id: media.id,
+            title: media.title,
+            sourceUrl: media.sourceUrl,
+            kind: media.kind,
+            format: media.format,
+            origin: media.origin
+          }
+          : null;
+
+      return createShareUrl({
+        type: "invite",
+        offer,
+        media: shareableMedia,
+        rtcConfig: readStoredRtcConfig()
+      });
+    },
+    [media]
+  );
+
   const createInviteLink = useCallback(async () => {
     const offer = await room.createHostOffer();
 
@@ -944,36 +1011,35 @@ export function App() {
       return;
     }
 
-    const shareableMedia: ShareMedia | null =
-      media?.origin === "remote-url"
-        ? {
-          id: media.id,
-          title: media.title,
-          sourceUrl: media.sourceUrl,
-          kind: media.kind,
-          format: media.format,
-          origin: media.origin
-        }
-        : null;
-
-    const nextInviteLink = createShareUrl({
-      type: "invite",
-      offer,
-      media: shareableMedia,
-      rtcConfig: readStoredRtcConfig()
-    });
-
+    const nextInviteLink = buildInviteLink(offer);
     setInviteLink(nextInviteLink);
     copyText(nextInviteLink);
 
     if (media?.origin === "local-file") {
       log("ok", "SHARE", "Invite link copied. The file will stream to viewers automatically when they connect.");
-    } else if (shareableMedia) {
+    } else if (media?.origin === "remote-url") {
       log("ok", "SHARE", "Invite link copied. The media URL will load for the viewer.");
     } else {
       log("ok", "SHARE", "Invite link copied. Add media whenever you are ready.");
     }
-  }, [log, media, room]);
+  }, [log, media, room, buildInviteLink]);
+
+  // Guests can share the room too — build (but don't auto-copy) an invite
+  // link the moment they're connected, using the host offer they already
+  // joined with. No new negotiation needed, unlike the host's flow above.
+  useEffect(() => {
+    if (room.role === "guest" && room.localOffer && !inviteLink) {
+      setInviteLink(buildInviteLink(room.localOffer));
+    }
+  }, [room.role, room.localOffer, inviteLink, buildInviteLink]);
+
+  // Clear a stale invite link once there's no active room at all, so a later
+  // join/host doesn't start out showing the previous room's link.
+  useEffect(() => {
+    if (room.role === "solo") {
+      setInviteLink("");
+    }
+  }, [room.role]);
 
   useEffect(() => {
     if (!isSecureOrigin) {
@@ -1235,6 +1301,10 @@ export function App() {
         playbackRate: element.playbackRate
       };
 
+      if (action === "pause" || action === "resume") {
+        localPauseIntentRef.current = { paused: action === "pause", setAt: performance.now() };
+      }
+
       setSnapshot(snapshot);
       roomRef.current?.sendGuestAction(action, snapshot);
       log("ok", "SYNC", `Sent ${action} to host — syncing the room.`);
@@ -1310,6 +1380,7 @@ export function App() {
       lastSeekAtRef.current = 0;
       isStalledRef.current = false;
       lastProgrammaticSeekRef.current = null;
+      localPauseIntentRef.current = null;
       lastPlayerErrorRef.current = null;
       setPlayerLoadError(null);
       log("ok", "MEDIA", `${file.name} mounted as local source.`);
@@ -2175,7 +2246,18 @@ export function App() {
 
             <div className="share-flow">
               {room.role === "guest" ? (
-                <div className="share-flow__guest-status">Viewer Mode</div>
+                inviteLink ? (
+                  <button
+                    type="button"
+                    className="primary-action"
+                    onClick={() => { copyText(inviteLink); log("ok", "SHARE", "Invite link copied to clipboard."); }}
+                  >
+                    <Clipboard size={15} />
+                    Copy Invite Link
+                  </button>
+                ) : (
+                  <div className="share-flow__guest-status">Viewer Mode</div>
+                )
               ) : room.role === "host" && inviteLink ? (
                 <button type="button" className="primary-action" onClick={() => { copyText(inviteLink); log("ok", "SHARE", "Invite link copied to clipboard."); }}>
                   <Clipboard size={15} />

@@ -241,7 +241,13 @@ const rtcConfig: ExtendedRTCConfiguration = {
       credential: "peerjsp"
     }
   ],
-  iceCandidatePoolSize: 10,
+  // A pool size of 10 makes each RTCPeerConnection eagerly pre-gather up to
+  // 10 candidates (more STUN traffic per connection) ahead of actually
+  // needing them — leftover from boilerplate, not a deliberate choice we're
+  // relying on. We don't do trickle-ICE optimizations that would benefit
+  // from a pre-warmed pool, so 1 is enough and noticeably lighter, especially
+  // multiplied across the 4 multiplexed channels each guest opens.
+  iceCandidatePoolSize: 1,
   iceTransportPolicy: "all"
 };
 
@@ -1371,7 +1377,19 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
             `Negotiating handshake with host: ${hostId}${relayOnly ? " via TURN relay-only ICE" : ""}`
           );
           const NUM_CHANNELS = 4;
-          for (let i = 0; i < NUM_CHANNELS; i++) {
+          // Opening all 4 multiplexed channels in the same tick means 4
+          // independent RTCPeerConnections each fire their own ICE gathering
+          // — and their own STUN queries against both configured servers —
+          // in the same instant, roughly quadrupling the STUN burst for a
+          // single join. Staggering channel creation spreads that traffic
+          // out; channel 0 (needed first for the approval handshake) still
+          // starts immediately, and the total spread is small enough to stay
+          // well within a comfortable connect time.
+          const CHANNEL_STAGGER_MS = 350;
+
+          const createChannel = (i: number) => {
+            if (joinAttemptRef.current !== attemptId) return;
+
             const conn = peer.connect(hostId, { reliable: true });
             setupConnectionDiagnostics(conn, `Host ${hostId} [${i}]`, onEventRef.current);
 
@@ -1432,11 +1450,15 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
                 }, 500);
                 return;
               }
-              
+
               if (connectionsRef.current.length === 0) {
                 setStatus("failed");
               }
             });
+          };
+
+          for (let i = 0; i < NUM_CHANNELS; i++) {
+            window.setTimeout(() => createChannel(i), i * CHANNEL_STAGGER_MS);
           }
         });
 
