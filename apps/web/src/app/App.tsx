@@ -170,6 +170,36 @@ function copyText(value: string) {
   void navigator.clipboard?.writeText(value);
 }
 
+/** Human-readable explanation for the standard HTMLMediaElement error codes. */
+function describeMediaErrorCode(code: number): string {
+  switch (code) {
+    case 1:
+      return "Loading was aborted.";
+    case 2:
+      return "A network error interrupted the download.";
+    case 3:
+      return "The media could not be decoded — the file may be corrupt or use an unsupported codec.";
+    case 4:
+      return "This source isn't a supported media format, the URL is invalid, or the server refused the request.";
+    default:
+      return "Unknown media error.";
+  }
+}
+
+// readyState 0 (HAVE_NOTHING) + networkState 3 (NETWORK_NO_SOURCE) + no
+// MediaError object means the browser never got usable media data at all —
+// not a decode/format problem. In practice this is almost always the remote
+// server refusing the request outright, most commonly hotlink/Referer
+// protection (very common on streaming and file-lock CDNs, which only allow
+// their own site to embed the link), a link that requires a login/session
+// cookie, or an expired one-time URL. It's a restriction on the source's
+// side — no amount of client-side retrying gets around it.
+const NO_SOURCE_HINT =
+  "No data was received from the server at all. This is almost always the server refusing the request — common causes are " +
+  "hotlink/Referer protection (many streaming and file-lock CDNs only allow their own site to embed the link), a link that " +
+  "requires a login/session, or an expired one-time URL. This is a restriction on the source's side, not something SyncPlayer " +
+  "can bypass. Try downloading the file and using \"Select File\" instead, or use a direct link from a host that allows embedding.";
+
 /**
  * Guest-side state for one incoming file transfer's OPFS write session.
  * Lives in a ref (activeFileWriteRef) rather than a closure-local variable so
@@ -391,6 +421,13 @@ export function App() {
   const hostFileRef = useRef<File | null>(null);
   const [guestStreamUrl, setGuestStreamUrl] = useState<string | null>(null);
   const [guestStreamMeta, setGuestStreamMeta] = useState<FileMeta | null>(null);
+  // Friendly, user-facing explanation shown over the player when the current
+  // media source fails to load (as opposed to the raw technical log entry).
+  const [playerLoadError, setPlayerLoadError] = useState<string | null>(null);
+  // Throttles repeated identical error reports (e.g. a player's own internal
+  // retry loop hitting the same failure every second) into one log entry
+  // plus a "repeated Nx" summary, instead of spamming the activity log.
+  const lastPlayerErrorRef = useRef<{ signature: string; at: number; count: number } | null>(null);
   const [activity, setActivity] = useState<ActivityEntry[]>([
     createActivity("info", "BOOT", "Command deck initialized.")
   ]);
@@ -406,6 +443,50 @@ export function App() {
   const log = useCallback((level: ActivityLevel, label: string, detail: string) => {
     setActivity((entries) => [createActivity(level, label, detail), ...entries].slice(0, 6));
   }, []);
+
+  // Shared by both the audio element and ArtPlayer's video error handler.
+  // Diagnoses the failure into a friendly, actionable message (surfaced as
+  // an overlay over the player, not just buried in the log) and throttles
+  // repeated identical errors instead of spamming the activity log.
+  const reportMediaError = useCallback(
+    (sourceLabel: "AUDIO" | "PLAYER", element: HTMLMediaElement | null) => {
+      if (!element) return;
+
+      const mediaError = element.error;
+      const signature = `${element.readyState}-${element.networkState}-${mediaError?.code ?? "none"}`;
+      const now = performance.now();
+      const last = lastPlayerErrorRef.current;
+
+      if (last && last.signature === signature && now - last.at < 4000) {
+        last.count += 1;
+        last.at = now;
+        return;
+      }
+
+      if (last && last.signature === signature && last.count > 1) {
+        log("warn", sourceLabel, `(previous error repeated ${last.count} times in the last few seconds)`);
+      }
+
+      lastPlayerErrorRef.current = { signature, at: now, count: 1 };
+
+      const isNoSource = element.networkState === 3 && element.readyState === 0 && !mediaError;
+      const friendlyMessage = isNoSource
+        ? NO_SOURCE_HINT
+        : mediaError
+          ? describeMediaErrorCode(mediaError.code)
+          : "The media failed to load for an unknown reason.";
+
+      setPlayerLoadError(friendlyMessage);
+      log(
+        "error",
+        sourceLabel,
+        `Load failed — readyState=${element.readyState}, networkState=${element.networkState}, error=${
+          mediaError ? `${mediaError.code} (${describeMediaErrorCode(mediaError.code)})` : "none"
+        }.`
+      );
+    },
+    [log]
+  );
 
   const roomRef = useRef<ReturnType<typeof usePeerRoom> | null>(null);
 
@@ -432,11 +513,9 @@ export function App() {
         return;
       }
 
-      const targetPosition = remoteSnapshot.paused 
-        ? remoteSnapshot.position 
+      const targetPosition = remoteSnapshot.paused
+        ? remoteSnapshot.position
         : remoteSnapshot.position + latencyMs / 1000;
-
-      remoteApplyRef.current = true;
 
       // Guests measure real drift and apply correction.
       if (roomRef.current?.role === "guest") {
@@ -477,17 +556,29 @@ export function App() {
         element.playbackRate = remoteSnapshot.playbackRate;
       }
 
-      if (remoteSnapshot.paused) {
-        element.pause();
-      } else {
-        await element.play().catch(() => {
-          log("warn", "PLAYBACK", "Browser blocked remote autoplay. Press play once to arm media.");
-        });
-      }
+      // Only force a play/pause transition — and only briefly suppress our
+      // own action-forwarding while doing it — when the local state actually
+      // differs from the host's. This used to run unconditionally on every
+      // incoming sync message (every 250ms-1000ms, forever), which kept
+      // remoteApplyRef true almost continuously and left guests barely any
+      // window to get their own pause/resume clicks forwarded at all — it
+      // looked like pause "didn't work" until the host changed state and a
+      // correction came through some other way.
+      if (remoteSnapshot.paused !== element.paused) {
+        remoteApplyRef.current = true;
 
-      window.setTimeout(() => {
-        remoteApplyRef.current = false;
-      }, 250);
+        if (remoteSnapshot.paused) {
+          element.pause();
+        } else {
+          await element.play().catch(() => {
+            log("warn", "PLAYBACK", "Browser blocked remote autoplay. Press play once to arm media.");
+          });
+        }
+
+        window.setTimeout(() => {
+          remoteApplyRef.current = false;
+        }, 250);
+      }
     },
     [log] // stable: reads live media via mediaStateRef, not the closed-over state
   );
@@ -707,6 +798,8 @@ export function App() {
       lastSeekAtRef.current = 0;
       isStalledRef.current = false;
       lastProgrammaticSeekRef.current = null;
+      lastPlayerErrorRef.current = null;
+      setPlayerLoadError(null);
       hostFileRef.current = null;
       log("ok", "MEDIA", source === "invite" ? "Media URL loaded from invite link." : `${mediaFormatLabel(nextMedia.format)} URL mounted.`);
       return nextMedia;
@@ -729,6 +822,8 @@ export function App() {
     lastSeekAtRef.current = 0;
     isStalledRef.current = false;
     lastProgrammaticSeekRef.current = null;
+    lastPlayerErrorRef.current = null;
+    setPlayerLoadError(null);
     log("ok", "MEDIA", `${nextMedia.title} mounted from host.`);
   }, [cleanupOpfsFile, log]);
 
@@ -1177,6 +1272,10 @@ export function App() {
       return;
     }
 
+    // Metadata loaded fine, so whatever previously failed no longer applies.
+    setPlayerLoadError(null);
+    lastPlayerErrorRef.current = null;
+
     const duration = element.duration || 0;
     setMedia({ ...media, durationSecs: duration });
     setSnapshot((current) => ({ ...current, duration }));
@@ -1211,6 +1310,8 @@ export function App() {
       lastSeekAtRef.current = 0;
       isStalledRef.current = false;
       lastProgrammaticSeekRef.current = null;
+      lastPlayerErrorRef.current = null;
+      setPlayerLoadError(null);
       log("ok", "MEDIA", `${file.name} mounted as local source.`);
 
       // If already hosting a connected room, stream immediately to all peers
@@ -1547,12 +1648,14 @@ export function App() {
         ctx.videoError = video.error ? { code: video.error.code, message: video.error.message } : null;
         ctx.readyState = video.readyState;
         ctx.networkState = video.networkState;
-        log("error", "PLAYER", `Video error event: readyState=${video.readyState} networkState=${video.networkState} error=${video.error ? JSON.stringify({ code: video.error.code, msg: video.error.message }) : "none"}`);
+        reportMediaError("PLAYER", video);
       } else if (error instanceof Error) {
         ctx.stack = error.stack?.slice(0, 300);
+        setPlayerLoadError(`The player threw an unexpected error: ${error.message}`);
         log("error", "PLAYER", `Video exception: ${error.message}`);
       } else {
         ctx.detail = String(detail ?? error);
+        setPlayerLoadError("The player failed to load this source for an unknown reason.");
         log("error", "PLAYER", `Video load failed: ${String(error)} (detail: ${String(detail)})`);
       }
       log("warn", "PLAYER-DEBUG", `Source: ${media.sourceUrl} | Format: ${media.format} | Kind: ${media.kind} | Info: ${JSON.stringify(ctx)}`);
@@ -1957,6 +2060,7 @@ export function App() {
                       onTimeUpdate={() => publishSnapshot(false)}
                       onWaiting={() => { isStalledRef.current = true; }}
                       onPlaying={() => { isStalledRef.current = false; }}
+                      onError={() => reportMediaError("AUDIO", mediaRef.current)}
                     />
                   </div>
                 ) : (
@@ -2011,6 +2115,20 @@ export function App() {
                   </div>
                 </div>
               )}
+
+              {/* Shown when the current source fails to load — surfaced here
+                  instead of only in the activity log, since a failed load
+                  otherwise just looks like an empty/frozen player. */}
+              {playerLoadError && (
+                <div className="media-load-error-overlay">
+                  <AlertTriangle size={36} />
+                  <strong>Playback Failed</strong>
+                  <span>{playerLoadError}</span>
+                  <button type="button" onClick={() => setPlayerLoadError(null)}>
+                    Dismiss
+                  </button>
+                </div>
+              )}
             </div>
           </Panel>
         </section>
@@ -2056,7 +2174,9 @@ export function App() {
             )}
 
             <div className="share-flow">
-              {room.role === "host" && inviteLink ? (
+              {room.role === "guest" ? (
+                <div className="share-flow__guest-status">Viewer Mode</div>
+              ) : room.role === "host" && inviteLink ? (
                 <button type="button" className="primary-action" onClick={() => { copyText(inviteLink); log("ok", "SHARE", "Invite link copied to clipboard."); }}>
                   <Clipboard size={15} />
                   Copy Invite Link
@@ -2069,7 +2189,7 @@ export function App() {
               )}
               <button type="button" onClick={room.closeRoom}>
                 <Pause size={15} />
-                End Room
+                {room.role === "guest" ? "Leave Room" : "End Room"}
               </button>
             </div>
 
@@ -2105,6 +2225,31 @@ export function App() {
                   Copy Code
                 </button>
                 <p className="room-code-hint">Viewers can type this 4-digit code to join instantly.</p>
+              </div>
+            )}
+
+            {/* ── Room Code — shown to a connected guest, the code they actually joined with ── */}
+            {room.role === "guest" && room.localOffer && (
+              <div className="room-code-display">
+                <span className="section-title">
+                  <Hash size={11} />
+                  Room Code
+                </span>
+                <div className="room-code-badge">
+                  <span className="room-code-digits">{formatRoomId(room.localOffer)}</span>
+                </div>
+                <button
+                  type="button"
+                  className="room-code-copy"
+                  onClick={() => {
+                    copyText(formatRoomId(room.localOffer));
+                    log("ok", "SHARE", `Room code ${formatRoomId(room.localOffer)} copied to clipboard.`);
+                  }}
+                >
+                  <Clipboard size={13} />
+                  Copy Code
+                </button>
+                <p className="room-code-hint">The code you joined with.</p>
               </div>
             )}
 

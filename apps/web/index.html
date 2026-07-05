@@ -3,6 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Media/video/audio elements don't support a per-element referrerpolicy
+      attribute (unlike <img>), so this is the only lever that reaches them.
+      Many streaming/CDN "vault" links used for direct media URLs reject
+      requests whose Referer names a foreign origin but still allow requests
+      with no Referer at all (e.g. direct downloads). Omitting it site-wide
+      costs us nothing (no analytics/referrer-dependent behavior here) and is
+      the one client-side fix that can help those sources load.
+    -->
+    <meta name="referrer" content="no-referrer" />
     <title>SyncPlayer Command Deck</title>
   </head>
   <body>

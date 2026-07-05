@@ -593,6 +593,56 @@ textarea {
   text-align: right;
 }
 
+/* ── Media load error overlay ─────────────────────────────────────────────── */
+/* Covers the player surface when the current source fails to load, so a
+   failed URL/file reads as a clear, explained failure instead of a silently
+   empty or frozen player. */
+.media-load-error-overlay {
+  align-items: center;
+  background: rgba(1, 5, 8, 0.94);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  inset: 0;
+  justify-content: center;
+  padding: 1.5rem;
+  position: absolute;
+  text-align: center;
+  z-index: 5;
+}
+
+.media-load-error-overlay svg {
+  color: var(--danger);
+  filter: drop-shadow(0 0 10px rgba(255, 92, 122, 0.4));
+}
+
+.media-load-error-overlay strong {
+  color: var(--danger);
+  font-size: 1rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.media-load-error-overlay span {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  max-width: 34rem;
+}
+
+.media-load-error-overlay button {
+  border-color: rgba(255, 92, 122, 0.5);
+  color: var(--danger);
+  margin-top: 0.2rem;
+}
+
+.media-load-error-overlay button:hover {
+  background: rgba(255, 92, 122, 0.1);
+  border-color: var(--danger);
+  box-shadow: 0 0 14px rgba(255, 92, 122, 0.25);
+}
+
 .control-strip {
   align-items: center;
   background: var(--panel-strong);
@@ -650,6 +700,20 @@ textarea {
   gap: 0.5rem;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-bottom: 0.55rem;
+}
+
+.share-flow__guest-status {
+  align-items: center;
+  background: rgba(138, 247, 211, 0.06);
+  border: 1px solid rgba(138, 247, 211, 0.28);
+  color: var(--accent-2);
+  display: flex;
+  font-size: 0.72rem;
+  font-weight: 700;
+  justify-content: center;
+  letter-spacing: 0.08em;
+  text-align: center;
+  text-transform: uppercase;
 }
 
 .primary-action {
