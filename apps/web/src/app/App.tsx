@@ -2452,9 +2452,9 @@ export function App() {
             <p style={{ margin: 0 }}>
               SyncPlayer is an open-source, peer-to-peer synchronized media player.
             </p>
-            <a href="https://github.com/animegamer4422/SyncPlayer" target="_blank" rel="noreferrer" style={{ color: 'var(--brand-primary)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+            <a href="https://github.com/Hari-Pi/SyncPlayer" target="_blank" rel="noreferrer" style={{ color: 'var(--brand-primary)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
               <Github size={15} style={{ transform: 'translateY(1px)' }} />
-              <span>github.com/animegamer4422/SyncPlayer</span>
+              <span>github.com/Hari-Pi/SyncPlayer</span>
             </a>
           </div>
         </Panel>
