@@ -508,7 +508,7 @@ export function App() {
   });
 
   const log = useCallback((level: ActivityLevel, label: string, detail: string) => {
-    setActivity((entries) => [createActivity(level, label, detail), ...entries].slice(0, 6));
+    setActivity((entries) => [createActivity(level, label, detail), ...entries]);
   }, []);
 
   // Shared by both the audio element and ArtPlayer's video error handler.
