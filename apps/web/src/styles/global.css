@@ -1277,6 +1277,15 @@ textarea {
   padding: 0.65rem 0.7rem;
 }
 
+.pending-requests--top {
+  align-items: center;
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: auto minmax(0, 1fr);
+  margin-bottom: 0;
+  padding: 0.55rem 1rem;
+}
+
 .pending-requests .section-title {
   align-items: center;
   color: var(--warn);
@@ -1287,6 +1296,11 @@ textarea {
   letter-spacing: 0.1em;
   margin-bottom: 0.5rem;
   text-transform: uppercase;
+}
+
+.pending-requests--top .section-title {
+  margin-bottom: 0;
+  white-space: nowrap;
 }
 
 .pending-request-list {
@@ -1342,6 +1356,13 @@ textarea {
   background: rgba(255, 92, 122, 0.1);
   border-color: rgba(255, 92, 122, 0.55);
   color: var(--danger);
+}
+
+@media (max-width: 760px) {
+  .pending-requests--top {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+  }
 }
 
 /* ── Room Code Display ─────────────────────────────────────────────────────── */

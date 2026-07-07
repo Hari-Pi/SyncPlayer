@@ -28,7 +28,7 @@ import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState, type Re
 import Artplayer from "artplayer";
 import QRCode from "qrcode";
 import { createActivity, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
-import { usePeerRoom } from "@/features/room/usePeerRoom";
+import { usePeerRoom, type PendingJoinRequest } from "@/features/room/usePeerRoom";
 import { ActivityLogPanel } from "@/components/room/ActivityLogPanel";
 import { FileProgressBar } from "@/components/room/FileProgressBar";
 import { createMediaHint, type DriftReading } from "@/lib/wasm/syncCore";
@@ -165,6 +165,56 @@ function Metric({ label, value, tone = "normal" }: { label: string; value: strin
     <div className={cx("metric", `metric--${tone}`)}>
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function PendingJoinRequests({
+  requests,
+  onAccept,
+  onDecline,
+  className
+}: {
+  requests: PendingJoinRequest[];
+  onAccept: (request: PendingJoinRequest) => void;
+  onDecline: (request: PendingJoinRequest) => void;
+  className?: string;
+}) {
+  if (requests.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className={cx("pending-requests", className)}>
+      <span className="section-title">
+        <UserPlus size={11} />
+        Join Requests ({requests.length})
+      </span>
+      <ul className="pending-request-list">
+        {requests.map((request) => (
+          <li key={request.peerId} className="pending-request-item">
+            <span className="pending-request-item__label">{request.label}</span>
+            <div className="pending-request-item__actions">
+              <button
+                type="button"
+                className="pending-request-item__accept"
+                onClick={() => onAccept(request)}
+              >
+                <Check size={13} />
+                Accept
+              </button>
+              <button
+                type="button"
+                className="pending-request-item__decline"
+                onClick={() => onDecline(request)}
+              >
+                <X size={13} />
+                Decline
+              </button>
+            </div>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -1881,6 +1931,21 @@ export function App() {
         </div>
       ) : null}
 
+      {room.role === "host" && room.pendingRequests.length > 0 && (
+        <PendingJoinRequests
+          requests={room.pendingRequests}
+          className="pending-requests--top"
+          onAccept={(request) => {
+            room.respondToJoinRequest(request.peerId, true);
+            log("ok", "ROOM", `Accepted join request from ${request.label}.`);
+          }}
+          onDecline={(request) => {
+            room.respondToJoinRequest(request.peerId, false);
+            log("warn", "ROOM", `Declined join request from ${request.label}.`);
+          }}
+        />
+      )}
+
       {room.status === "connected" ? (
         <div className="status-band status-band--success">
           <div className="status-band__content">
@@ -2069,7 +2134,7 @@ export function App() {
           <div className="control-strip">
             <label
               className={cx("file-button", mediaSelectionLocked && "file-button--disabled")}
-              title={isGuestControlled ? "Media is controlled by the host" : undefined}
+              title={isGuestControlled ? "Controlled by the host" : undefined}
             >
               <Upload size={16} />
               Select File
@@ -2085,16 +2150,16 @@ export function App() {
                     void handleRemoteUrl();
                   }
                 }}
-                placeholder={isGuestControlled ? "Media is controlled by the host" : "Paste MP4, MP3, M3U8, MPD, WebM..."}
+                placeholder={isGuestControlled ? "Controlled by the host" : "Paste MP4, MP3, M3U8, MPD, WebM..."}
                 aria-label="Remote media URL, including MP4, WebM, M3U8, MPD, MP3, WAV, or OGG"
                 disabled={mediaSelectionLocked}
-                title={isGuestControlled ? "Media is controlled by the host" : undefined}
+                title={isGuestControlled ? "Controlled by the host" : undefined}
               />
               <button
                 type="button"
                 onClick={handleRemoteUrl}
                 disabled={mediaSelectionLocked}
-                title={isGuestControlled ? "Media is controlled by the host" : undefined}
+                title={isGuestControlled ? "Controlled by the host" : undefined}
               >
                 <Send size={15} />
                 Load URL
@@ -2366,48 +2431,6 @@ export function App() {
                     Join
                   </button>
                 </div>
-              </div>
-            )}
-
-            {/* Pending join requests — only ever populated when "allow all
-                connections" is off. Each one needs an explicit decision. */}
-            {room.role === "host" && room.pendingRequests.length > 0 && (
-              <div className="pending-requests">
-                <span className="section-title">
-                  <UserPlus size={11} />
-                  Join Requests ({room.pendingRequests.length})
-                </span>
-                <ul className="pending-request-list">
-                  {room.pendingRequests.map((request) => (
-                    <li key={request.peerId} className="pending-request-item">
-                      <span className="pending-request-item__label">{request.label}</span>
-                      <div className="pending-request-item__actions">
-                        <button
-                          type="button"
-                          className="pending-request-item__accept"
-                          onClick={() => {
-                            room.respondToJoinRequest(request.peerId, true);
-                            log("ok", "ROOM", `Accepted join request from ${request.label}.`);
-                          }}
-                        >
-                          <Check size={13} />
-                          Accept
-                        </button>
-                        <button
-                          type="button"
-                          className="pending-request-item__decline"
-                          onClick={() => {
-                            room.respondToJoinRequest(request.peerId, false);
-                            log("warn", "ROOM", `Declined join request from ${request.label}.`);
-                          }}
-                        >
-                          <X size={13} />
-                          Decline
-                        </button>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
               </div>
             )}
 
