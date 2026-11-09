@@ -31,6 +31,7 @@ import { createActivity, type ActivityEntry, type ActivityLevel } from "@/featur
 import { usePeerRoom, type PendingJoinRequest } from "@/features/room/usePeerRoom";
 import { ActivityLogPanel } from "@/components/room/ActivityLogPanel";
 import { FileProgressBar } from "@/components/room/FileProgressBar";
+import { ChunkTransferView } from "@/components/room/ChunkTransferView";
 import { createMediaHint, type DriftReading } from "@/lib/wasm/syncCore";
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
 import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia, type MediaKind, type MediaFormat } from "@/lib/media/mediaTypes";
@@ -1661,6 +1662,7 @@ export function App() {
   // still receiving the file. A late joiner gets the file sent to them alone
   // in the background (see the late-join effect below) — that shouldn't
   // pause or lock anything, since other viewers are already watching in sync.
+  const getReceivedChunks = useCallback(() => activeFileWriteRef.current?.receivedIndices, []);
   const isUploadLocked = room.role === "host" && !!room.fileSendProgress && !room.fileSendProgress.background;
 
   // Viewers don't pick their own media — the host mounts it (or streams the
@@ -1966,17 +1968,6 @@ export function App() {
           </div>
 
           <Panel title="Playback Surface" icon={<Video size={15} />} className="player-panel">
-            {/* Guest receive progress bar */}
-            {guestStreamMeta && room.fileReceiveProgress && (
-              <FileProgressBar
-                label={guestStreamMeta.isBlob ? "Receiving file" : "Streaming"}
-                fileName={guestStreamMeta.fileName}
-                chunksDone={room.fileReceiveProgress.chunksReceived}
-                total={room.fileReceiveProgress.total}
-                totalBytes={room.fileReceiveProgress.totalBytes}
-                style={{ marginBottom: "1rem" }}
-              />
-            )}
             <div className="player-shell">
               {media ? (
                 media.kind === "audio" ? (
@@ -2003,11 +1994,24 @@ export function App() {
                     className="artplayer-container"
                   />
                 )
-              ) : (
+              ) : guestStreamMeta ? null : (
                 <div className="empty-player">
                   <ScanLine size={54} />
-                  <strong>{guestStreamMeta ? `Receiving "${guestStreamMeta.fileName}"...` : "Mount media to begin"}</strong>
-                  <span>{guestStreamMeta ? `${guestStreamMeta.isBlob ? "Full file transfer" : "MSE progressive stream"} in progress` : "Local files stream to viewers automatically over P2P."}</span>
+                  <strong>Mount media to begin</strong>
+                  <span>Local files stream to viewers automatically over P2P.</span>
+                </div>
+              )}
+
+              {/* Guest: the player area itself shows the transfer, chunk by chunk. */}
+              {guestStreamMeta && room.fileReceiveProgress && (
+                <div className="upload-lock-overlay">
+                  <ChunkTransferView
+                    fileName={guestStreamMeta.fileName}
+                    chunksReceived={room.fileReceiveProgress.chunksReceived}
+                    total={room.fileReceiveProgress.total}
+                    totalBytes={room.fileReceiveProgress.totalBytes}
+                    getReceived={getReceivedChunks}
+                  />
                 </div>
               )}
 

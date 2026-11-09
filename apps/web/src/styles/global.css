@@ -1634,3 +1634,49 @@ textarea {
   margin: 0;
   line-height: 1.4;
 }
+
+/* Guest file receive: chunk map shown in place of the player */
+.chunk-transfer {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  height: 100%;
+  width: 100%;
+}
+
+.chunk-transfer__head {
+  align-items: center;
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  min-width: 0;
+}
+
+.chunk-transfer__head strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chunk-transfer__map {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+}
+
+.chunk-transfer__stats {
+  display: flex;
+  flex-wrap: wrap;
+  font-family: var(--mono, ui-monospace, monospace);
+  gap: 0.4rem 1.25rem;
+  justify-content: center;
+}
+
+.chunk-transfer__stats b {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.upload-lock-overlay .chunk-transfer__stats span {
+  max-width: none;
+}
