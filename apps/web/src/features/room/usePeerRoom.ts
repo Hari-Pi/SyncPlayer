@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Peer, DataConnection, type PeerJSOption } from "peerjs";
 import type { PlaybackSnapshot, WireMessage, FileMeta, RemoteMediaMount, PlaybackConfig, GuestPlaybackAction } from "@/lib/webrtc/messages";
 import { CHUNK_SIZE, PROTOCOL_VERSION, isWireMessage } from "@/lib/webrtc/messages";
@@ -510,9 +510,20 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     };
   }, []);
 
+  // Message types we've already reported a send failure for (avoid one log line per 250 ms tick).
+  const reportedSendErrorsRef = useRef<Set<string>>(new Set());
   const sendToOne = useCallback((conn: DataConnection, type: WireMessage["type"], payload: WireMessage["payload"]) => {
     if (!conn.open) return;
-    conn.send({ id: crypto.randomUUID(), type, sentAt: performance.now(), payload });
+    try {
+      conn.send({ id: crypto.randomUUID(), type, sentAt: performance.now(), payload });
+    } catch (err) {
+      // PeerJS's encoder throws on values it can't pack (e.g. Infinity). One bad message must not
+      // break the caller's loop (it used to silently kill every playback broadcast).
+      if (!reportedSendErrorsRef.current.has(type)) {
+        reportedSendErrorsRef.current.add(type);
+        onEventRef.current("error", "WEBRTC", `Could not send ${type}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }, []);
 
   const send = useCallback((type: WireMessage["type"], payload: WireMessage["payload"]) => {
@@ -1678,34 +1689,68 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     send("clock.ping", { pingId, originAt });
   }, [send]);
 
-  return {
-    role,
-    status,
-    roomCode: peerId.replace(/^SP-/, ""),
-    remotePeer,
-    localOffer,
-    latencyMs,
-    connectedPeers,
-    fileSendProgress,
-    fileReceiveProgress,
-    peerFileProgress,
-    pendingRequests,
-    respondToJoinRequest,
-    createHostOffer,
-    joinWithOffer,
-    closeRoom,
-    pingPeer,
-    sendPlaybackState,
-    sendMediaMount,
-    sendConfigRequest,
-    sendConfigState,
-    broadcastConfigChanged,
-    reportSyncHealth,
-    sendGuestAction,
-    sendFileResume,
-    sendFileRetry,
-    sendFileAborted,
-    releaseUploadLock,
-    sendFile
-  };
+  // Memoized: callers list `room` in effect dependencies, and a fresh object every render made those
+  // effects (and their timers) re-run on every render — timers never fired and requests looped.
+  return useMemo(
+    () => ({
+      role,
+      status,
+      roomCode: peerId.replace(/^SP-/, ""),
+      remotePeer,
+      localOffer,
+      latencyMs,
+      connectedPeers,
+      fileSendProgress,
+      fileReceiveProgress,
+      peerFileProgress,
+      pendingRequests,
+      respondToJoinRequest,
+      createHostOffer,
+      joinWithOffer,
+      closeRoom,
+      pingPeer,
+      sendPlaybackState,
+      sendMediaMount,
+      sendConfigRequest,
+      sendConfigState,
+      broadcastConfigChanged,
+      reportSyncHealth,
+      sendGuestAction,
+      sendFileResume,
+      sendFileRetry,
+      sendFileAborted,
+      releaseUploadLock,
+      sendFile
+    }),
+    [
+      role,
+      status,
+      peerId,
+      remotePeer,
+      localOffer,
+      latencyMs,
+      connectedPeers,
+      fileSendProgress,
+      fileReceiveProgress,
+      peerFileProgress,
+      pendingRequests,
+      respondToJoinRequest,
+      createHostOffer,
+      joinWithOffer,
+      closeRoom,
+      pingPeer,
+      sendPlaybackState,
+      sendMediaMount,
+      sendConfigRequest,
+      sendConfigState,
+      broadcastConfigChanged,
+      reportSyncHealth,
+      sendGuestAction,
+      sendFileResume,
+      sendFileRetry,
+      sendFileAborted,
+      releaseUploadLock,
+      sendFile
+    ]
+  );
 }

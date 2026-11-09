@@ -118,6 +118,9 @@ function createRemoteMedia(url: string): LoadedMedia {
 // Auto-reconnect attempts (2s, 4s, 8s, 16s, 16s, 16s) before handing control back to the viewer.
 const MAX_RECONNECT_ATTEMPTS = 6;
 
+// WebM files often report Infinity until fully scanned, and PeerJS can't encode Infinity.
+const finiteOr0 = (value: number) => (Number.isFinite(value) ? value : 0);
+
 export function App() {
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const artplayerContainerRef = useRef<HTMLDivElement | null>(null);
@@ -203,8 +206,10 @@ export function App() {
   // Throttles repeated identical error reports (e.g. a player's own internal
   // retry loop hitting the same failure every second) into one log entry
   // plus a "repeated Nx" summary, instead of spamming the activity log.
+  const skipNoticeShownRef = useRef(false);
   const lastPlayerErrorRef = useRef<{ signature: string; at: number; count: number } | null>(null);
-  const [activity, setActivity] = useState<ActivityEntry[]>([
+  const [activity, setActivity] = useState<ActivityEntry[]>(() => [
+    // Lazy: createActivity also records into the full log history, so it must run once, not every render.
     createActivity("info", "BOOT", "Command deck initialized.")
   ]);
   const [drift, setDrift] = useState<DriftReading>(emptyDrift);
@@ -217,7 +222,9 @@ export function App() {
   });
 
   const log = useCallback((level: ActivityLevel, label: string, detail: string) => {
-    setActivity((entries) => [createActivity(level, label, detail), ...entries].slice(0, VISIBLE_ACTIVITY_LIMIT));
+    // Created outside the updater: React may call updaters twice (StrictMode), which would double-record it.
+    const entry = createActivity(level, label, detail);
+    setActivity((entries) => [entry, ...entries].slice(0, VISIBLE_ACTIVITY_LIMIT));
   }, []);
 
   // Shared by both the audio element and ArtPlayer's video error handler.
@@ -283,9 +290,14 @@ export function App() {
       const currentMedia = mediaStateRef.current;
 
       if (!element || !currentMedia) {
-        log("warn", "SYNC", `No media element or media mounted yet. Skipping remote state.`);
+        // Normal while a file is still downloading; say it once, not on every 250 ms update.
+        if (!skipNoticeShownRef.current) {
+          skipNoticeShownRef.current = true;
+          log("info", "SYNC", "Host is playing; you'll join in sync as soon as your media is ready.");
+        }
         return;
       }
+      skipNoticeShownRef.current = false;
 
       if (remoteSnapshot.mediaId !== null && remoteSnapshot.mediaId !== currentMedia.id) {
         log(
@@ -317,7 +329,10 @@ export function App() {
         );
 
         // Graduated drift correction: soft/firm nudge playbackRate, seek for large drift.
-        if (reading.mode === "seek") {
+        // While both sides are paused a rate nudge does nothing, so any drift beyond the dead zone
+        // is fixed by snapping to the host's exact position (cheap when nothing is playing).
+        const pausedOffset = remoteSnapshot.paused && element.paused && reading.mode !== "hold";
+        if (reading.mode === "seek" || pausedOffset) {
           const now = performance.now();
           const recovering = isStalledRef.current || now - lastSeekAtRef.current < SEEK_COOLDOWN_MS;
 
@@ -682,11 +697,11 @@ export function App() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      room.pingPeer();
+      roomRef.current?.pingPeer();
     }, 3500);
 
     return () => window.clearInterval(timer);
-  }, [room]);
+  }, []);
 
   // Guest: report local buffering health once a second so the host can adapt
   // this peer's broadcast cadence (see usePeerRoom's adaptive interval logic).
@@ -698,11 +713,11 @@ export function App() {
     const timer = window.setInterval(() => {
       const element = mediaRef.current;
       const bufferedAheadSecs = element ? getBufferedAheadSecs(element) : 0;
-      room.reportSyncHealth(isStalledRef.current, bufferedAheadSecs);
+      roomRef.current?.reportSyncHealth(isStalledRef.current, bufferedAheadSecs);
     }, 1000);
 
     return () => window.clearInterval(timer);
-  }, [room.role, room]);
+  }, [room.role]);
 
   // Host meter: show measured peer latency (one-way, EWMA-smoothed) in the
   // ring since the host has no upstream position to drift against. Guests
@@ -728,19 +743,28 @@ export function App() {
 
   // Guest: request config from host on connect
   useEffect(() => {
+    // Once per connect: depending on `room` itself re-sent this on every render, and each reply
+    // caused another render — an endless config.request/config.state loop.
     if (room.role === "guest" && room.status === "connected") {
-      room.sendConfigRequest();
+      roomRef.current?.sendConfigRequest();
     }
-  }, [room.role, room.status, room]);
+  }, [room.role, room.status]);
 
   useEffect(() => {
+    const seenTabs = new Set<string>();
     const channel = createLocalTabChannel((message) => {
       if (message.type === "hello") {
-        log("ok", "LOCAL TAB", "Another SyncPlayer tab is available for same-device testing.");
+        if (!seenTabs.has(message.peerId)) {
+          seenTabs.add(message.peerId);
+          log("ok", "LOCAL TAB", "Another SyncPlayer tab is available for same-device testing.");
+        }
         return;
       }
 
-      if (message.type === "playback") {
+      // Same-device tab sync is only for testing without a room. Inside a room the WebRTC sync
+      // is authoritative; applying another tab's state here (e.g. a viewer tab on the same
+      // machine, paused at 0 while it downloads) would pause/rewind the host.
+      if (message.type === "playback" && roomRef.current?.role === "solo") {
         void handleRemotePlayback(message.payload, 0);
       }
     });
@@ -818,7 +842,7 @@ export function App() {
     const nextSnapshot = {
       mediaId: media.id,
       position: element.currentTime,
-      duration: element.duration || 0,
+      duration: finiteOr0(element.duration),
       paused: element.paused,
       playbackRate: element.playbackRate
     };
@@ -834,16 +858,20 @@ export function App() {
     );
 
     if (now - lastBroadcastRef.current > 250 || isManual) {
-      if (room.role === "host") {
-        room.sendPlaybackState(nextSnapshot);
+      // Via the ref so this callback (and the 250 ms timer built on it) stays stable across renders.
+      const currentRoom = roomRef.current;
+      if (currentRoom?.role === "host") {
+        currentRoom.sendPlaybackState(nextSnapshot);
       }
-      localTabChannelRef.current?.post({
-        type: "playback",
-        payload: nextSnapshot
-      });
+      if (!currentRoom || currentRoom.role === "solo") {
+        localTabChannelRef.current?.post({
+          type: "playback",
+          payload: nextSnapshot
+        });
+      }
       lastBroadcastRef.current = now;
     }
-  }, [media, room]);
+  }, [media]);
 
   useEffect(() => {
     const timer = window.setInterval(() => publishSnapshot(false), 250);
@@ -943,7 +971,7 @@ export function App() {
       const snapshot: PlaybackSnapshot = {
         mediaId: mediaStateRef.current?.id ?? null,
         position: element.currentTime,
-        duration: element.duration || 0,
+        duration: finiteOr0(element.duration),
         paused: element.paused,
         playbackRate: element.playbackRate
       };
@@ -993,7 +1021,7 @@ export function App() {
     setPlayerLoadError(null);
     lastPlayerErrorRef.current = null;
 
-    const duration = element.duration || 0;
+    const duration = finiteOr0(element.duration);
     setMedia({ ...media, durationSecs: duration });
     setSnapshot((current) => ({ ...current, duration }));
   }, [media]);
