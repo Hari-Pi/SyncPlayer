@@ -195,6 +195,8 @@ export function App() {
   const hostFileRef = useRef<File | null>(null);
   const [, setGuestStreamUrl] = useState<string | null>(null);
   const [guestStreamMeta, setGuestStreamMeta] = useState<FileMeta | null>(null);
+  // Guest: post-download step (saving, assembling, opening) shown in the player area until it's ready.
+  const [receiveStage, setReceiveStage] = useState<string | null>(null);
   // Friendly, user-facing explanation shown over the player when the current
   // media source fails to load (as opposed to the raw technical log entry).
   const [playerLoadError, setPlayerLoadError] = useState<string | null>(null);
@@ -440,6 +442,7 @@ export function App() {
         guestFileRef,
         staleBlobUrlRef,
         setGuestStreamMeta,
+        setReceiveStage,
         setGuestStreamUrl,
         setMedia
       }),
@@ -1019,6 +1022,9 @@ export function App() {
 
     // Metadata loaded fine, so whatever previously failed no longer applies.
     setPlayerLoadError(null);
+    // A received file is now playable: drop the "processing" view.
+    setGuestStreamMeta(null);
+    setReceiveStage(null);
     lastPlayerErrorRef.current = null;
 
     const duration = finiteOr0(element.duration);
@@ -1842,14 +1848,15 @@ export function App() {
               )}
 
               {/* Guest: the player area itself shows the transfer, chunk by chunk. */}
-              {guestStreamMeta && room.fileReceiveProgress && (
+              {guestStreamMeta && (room.fileReceiveProgress || (receiveStage && !playerLoadError)) && (
                 <div className="upload-lock-overlay">
                   <ChunkTransferView
                     fileName={guestStreamMeta.fileName}
-                    chunksReceived={room.fileReceiveProgress.chunksReceived}
-                    total={room.fileReceiveProgress.total}
-                    totalBytes={room.fileReceiveProgress.totalBytes}
+                    chunksReceived={room.fileReceiveProgress?.chunksReceived ?? guestStreamMeta.totalChunks}
+                    total={room.fileReceiveProgress?.total ?? guestStreamMeta.totalChunks}
+                    totalBytes={room.fileReceiveProgress?.totalBytes ?? guestStreamMeta.fileSize}
                     getReceived={getReceivedChunks}
+                    stage={room.fileReceiveProgress ? null : receiveStage}
                   />
                 </div>
               )}

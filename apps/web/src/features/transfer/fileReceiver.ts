@@ -43,6 +43,8 @@ export type ActiveFileWrite = {
   retries: number;
   /** performance.now() of the most recent chunk to arrive (for the post-end quiet-period check). */
   lastChunkAt: number;
+  /** Chunks that arrived but are still queued for writing (received != saved for big files). */
+  pendingWrites: number;
 };
 
 /** Where received chunks are written: a main-thread OPFS stream or the worker fallback. */
@@ -92,6 +94,8 @@ export type FileReceiverDeps = {
   guestFileRef: MutableRefObject<File | null>;
   staleBlobUrlRef: MutableRefObject<string | null>;
   setGuestStreamMeta: Dispatch<SetStateAction<FileMeta | null>>;
+  /** What the receiver is doing after the last chunk arrived (null while still receiving or once done). */
+  setReceiveStage: Dispatch<SetStateAction<string | null>>;
   setGuestStreamUrl: Dispatch<SetStateAction<string | null>>;
   setMedia: Dispatch<SetStateAction<LoadedMedia | null>>;
 };
@@ -105,7 +109,7 @@ export type FileReceiverDeps = {
 export function createFileReceiver(deps: FileReceiverDeps) {
   const {
     log, cleanupOpfsFile, roomRef, activeFileWriteRef, opfsFileHandleRef, opfsFileNameRef,
-    guestFileRef, staleBlobUrlRef, setGuestStreamMeta, setGuestStreamUrl, setMedia
+    guestFileRef, staleBlobUrlRef, setGuestStreamMeta, setReceiveStage, setGuestStreamUrl, setMedia
   } = deps;
 
   return (meta: FileMeta): FileStreamHandlers => {
@@ -135,6 +139,7 @@ export function createFileReceiver(deps: FileReceiverDeps) {
     if (isResume) {
       write = existing!;
       setGuestStreamMeta(meta);
+      setReceiveStage(null);
       log(
         "info",
         "FILE",
@@ -149,6 +154,7 @@ export function createFileReceiver(deps: FileReceiverDeps) {
         return null;
       });
       setGuestStreamMeta(meta);
+      setReceiveStage(null);
       log("info", "FILE", `Receiving "${meta.fileName}" (${(meta.fileSize / 1024 / 1024).toFixed(1)} MB) from host...`);
 
       const opfsFileName = `syncplayer-transfer-${meta.mediaId}`;
@@ -172,7 +178,8 @@ export function createFileReceiver(deps: FileReceiverDeps) {
         finalized: false,
         aborted: false,
         retries: 0,
-        lastChunkAt: 0
+        lastChunkAt: 0,
+        pendingWrites: 0
       };
       activeFileWriteRef.current = write;
 
@@ -215,12 +222,18 @@ export function createFileReceiver(deps: FileReceiverDeps) {
     // full resume-ack timeout).
     roomRef.current?.sendFileResume(meta.mediaId, indicesToRanges(write.receivedIndices));
 
+    let lastStageAt = 0;
+    const savingStage = () =>
+      `Saving to disk… ${write.receivedIndices.size.toLocaleString()} / ${write.totalChunks.toLocaleString()} chunks`;
+
     const finalizeFile = () => {
       if (write.finalized || write.aborted) return;
       write.finalized = true;
 
       write.writeQueue = write.writeQueue.then(async () => {
         try {
+          // Closing the OPFS stream commits the whole file; for big files this is the slow step.
+          setReceiveStage("Assembling the file…");
           const combined = combineChecksums(write.chunkChecksums, write.totalChunks);
           if (write.pendingHostChecksum && combined !== write.pendingHostChecksum) {
             log(
@@ -257,6 +270,7 @@ export function createFileReceiver(deps: FileReceiverDeps) {
 
           guestFileRef.current = file;
           const url = URL.createObjectURL(file);
+          setReceiveStage("Opening in the player…");
 
           setGuestStreamUrl(url);
           setMedia({
@@ -268,10 +282,11 @@ export function createFileReceiver(deps: FileReceiverDeps) {
             origin: "local-file",
             sizeBytes: urlSizeBytes
           });
-          setGuestStreamMeta(null);
           log("ok", "FILE", `"${write.fileName}" completely downloaded via ${write.storageMode === "opfs" ? "persistent storage" : "memory fallback"} and mounted for playback.`);
         } catch (err) {
           log("error", "FILE", `Failed to finalize file transfer: ${err instanceof Error ? err.message : String(err)}`);
+          setReceiveStage(null);
+          setGuestStreamMeta(null);
         }
       });
     };
@@ -281,8 +296,10 @@ export function createFileReceiver(deps: FileReceiverDeps) {
       onChunk: (index, _total, data, checksum) => {
         if (write.aborted || write.finalized || write.receivedIndices.has(index)) return;
         write.lastChunkAt = performance.now();
+        write.pendingWrites += 1;
 
         write.writeQueue = write.writeQueue.then(async () => {
+          write.pendingWrites -= 1;
           if (write.aborted || write.finalized) return;
           try {
             const chunk = new Uint8Array(data.byteLength);
@@ -315,6 +332,9 @@ export function createFileReceiver(deps: FileReceiverDeps) {
 
           if (write.endReceived && write.receivedIndices.size >= write.totalChunks) {
             finalizeFile();
+          } else if (write.endReceived && performance.now() - lastStageAt > 250) {
+            lastStageAt = performance.now();
+            setReceiveStage(savingStage());
           }
         });
       },
@@ -325,6 +345,10 @@ export function createFileReceiver(deps: FileReceiverDeps) {
           finalizeFile();
         } else {
           write.endReceived = true;
+          // Everything may already have arrived and just be queued for writing (big files).
+          setReceiveStage(
+            write.receivedIndices.size + write.pendingWrites >= write.totalChunks ? savingStage() : "Waiting for the last chunks…"
+          );
           // Chunks can still be in flight on other channels; check again shortly and
           // ask the host to re-send anything still missing or that failed verification.
           const checkMissing = () => {

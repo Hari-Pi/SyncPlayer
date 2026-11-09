@@ -1704,3 +1704,46 @@ textarea {
   font-size: 0.75rem;
   margin-top: 0.2rem;
 }
+
+/* Post-download processing: indeterminate bar (OPFS commit time isn't measurable) */
+.chunk-transfer__stage {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.chunk-transfer__stage-bar {
+  background: var(--line-soft);
+  height: 3px;
+  overflow: hidden;
+  position: relative;
+}
+
+.chunk-transfer__stage-bar::after {
+  animation: chunk-stage-slide 1.2s ease-in-out infinite;
+  background: var(--accent);
+  content: "";
+  inset: 0 auto 0 0;
+  position: absolute;
+  width: 30%;
+}
+
+@keyframes chunk-stage-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(350%); }
+}
+
+.chunk-transfer__spin {
+  animation: chunk-spin 1s linear infinite;
+}
+
+@keyframes chunk-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chunk-transfer__stage-bar::after,
+  .chunk-transfer__spin {
+    animation: none;
+  }
+}

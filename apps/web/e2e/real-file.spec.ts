@@ -17,8 +17,32 @@ test("guest follows host playback of a real video file", async ({ context }) => 
   await guest.getByRole("button", { name: /^join$/i }).click();
   await expect(guest.getByText(/live session synchronized/i)).toBeVisible({ timeout: 30_000 });
 
+  // Sample the guest's player area every 50 ms: from the first chunk until the player is ready,
+  // it must always show either the chunk view (receiving or processing) or a loaded player.
+  await guest.evaluate(() => {
+    const w = window as unknown as { __samples: Array<{ at: number; view: string; ready: boolean }> };
+    w.__samples = [];
+    setInterval(() => {
+      const view = document.querySelector(".chunk-transfer")?.textContent ?? "";
+      const video = document.querySelector<HTMLVideoElement>(".artplayer-container video");
+      w.__samples.push({ at: performance.now(), view, ready: !!video && video.readyState >= 1 });
+    }, 50);
+  });
   await host.locator("input[type=file]").setInputFiles(file!);
   await expect(guest.getByText(/integrity check passed/i).first()).toBeVisible({ timeout: 180_000 });
+  await expect.poll(() => guest.locator(".artplayer-container video").evaluate((v: HTMLVideoElement) => v.readyState), { timeout: 60_000 }).toBeGreaterThan(0);
+
+  const samples = await guest.evaluate(() => (window as unknown as { __samples: Array<{ at: number; view: string; ready: boolean }> }).__samples);
+  const firstView = samples.findIndex((x) => x.view);
+  const firstReady = samples.findIndex((x) => x.ready);
+  const gap = samples.slice(firstView, firstReady).filter((x) => !x.view);
+  const stages = new Map<string, number>();
+  for (const x of samples.slice(firstView, firstReady)) {
+    const stage = /processing/i.test(x.view) ? x.view.replace(/.*"[^"]*"/, "").split(/\d/)[0].trim() : "receiving";
+    stages.set(stage, (stages.get(stage) ?? 0) + 50);
+  }
+  console.log("stages (ms):", Object.fromEntries(stages), "blank samples:", gap.length);
+  expect(gap.length).toBe(0);
   await expect(guest.getByText(/can't play/i)).toHaveCount(0);
 
   const video = (p: typeof host) => p.locator(".artplayer-container video");
