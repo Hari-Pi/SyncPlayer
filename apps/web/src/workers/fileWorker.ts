@@ -9,7 +9,7 @@
 import { chunkChecksum } from "@/lib/media/checksum";
 
 type WorkerInMessage =
-  | { type: "start"; file: File; mediaId: string; chunkSize: number; startChunkIndex: number; endChunkIndex: number; totalChunks: number }
+  | { type: "start"; file: File; mediaId: string; chunkSize: number; startChunkIndex: number; endChunkIndex: number; totalChunks: number; knownChecksums?: string[] }
   | { type: "cancel" }
   // Backpressure: the main thread grants one credit per chunk it has finished with.
   | { type: "credit"; n: number };
@@ -45,7 +45,7 @@ self.onmessage = async (e: MessageEvent<WorkerInMessage>) => {
   if (msg.type === "start") {
     canceled = false;
     credits += INITIAL_CREDITS;
-    const { file, mediaId, chunkSize, startChunkIndex, endChunkIndex, totalChunks } = msg;
+    const { file, mediaId, chunkSize, startChunkIndex, endChunkIndex, totalChunks, knownChecksums } = msg;
 
     try {
       for (let i = startChunkIndex; i < endChunkIndex; i++) {
@@ -62,7 +62,8 @@ self.onmessage = async (e: MessageEvent<WorkerInMessage>) => {
         const buffer = await slice.arrayBuffer();
         const data = new Uint8Array(buffer);
 
-        const cSum = chunkChecksum(i, data);
+        // Late joiners re-send the same File: reuse the checksums computed the first time.
+        const cSum = knownChecksums?.[i] ?? chunkChecksum(i, data);
 
         // Send chunk back to main thread
         // We use transferables to avoid copying the buffer again

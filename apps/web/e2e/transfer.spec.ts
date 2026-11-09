@@ -176,3 +176,29 @@ test("the guest follows the host's playback of a WebM with unknown duration", as
   await expect.poll(async () => (await state(guest)).paused, { timeout: 15_000 }).toBe(true);
   await expect.poll(async () => Math.abs((await state(guest)).t - 4), { timeout: 15_000 }).toBeLessThan(0.1);
 });
+
+test("opening another tab does not delete a file this tab received", async ({ context }) => {
+  const { guest } = await setup(context);
+  await expect(guest.getByText(/integrity check passed/i).first()).toBeVisible({ timeout: 60_000 });
+  const files = () =>
+    guest.evaluate(async () => {
+      const names: string[] = [];
+      const root = await navigator.storage.getDirectory();
+      // @ts-expect-error entries() isn't in the DOM typings yet
+      for await (const [name] of root.entries()) names.push(name);
+      return names;
+    });
+  expect(await files()).toHaveLength(1);
+  const another = await context.newPage();
+  await another.goto("/");
+  await another.waitForTimeout(2000); // startup cleanup runs here
+  expect(await files()).toHaveLength(1);
+});
+
+test("a late joiner receives the already-shared file (re-send reuses checksums)", async ({ context }) => {
+  const { host } = await setup(context);
+  await expect(host.getByText(/fully sent/i).first()).toBeVisible({ timeout: 60_000 });
+  const late = await context.newPage();
+  await join(late, (await host.locator(".room-code-digits").innerText()).trim());
+  await expect(late.getByText(/integrity check passed/i).first()).toBeVisible({ timeout: 60_000 });
+});

@@ -22,7 +22,7 @@ export type FileMeta = {
 export const CHUNK_SIZE = 64 * 1024;
 
 /** Bump when the wire format changes incompatibly; peers on different versions refuse to pair. */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export type PlaybackConfig = {
   subtitleTrack: number; // -1 = off, 0+ = embedded track index
@@ -223,5 +223,65 @@ export function isWireMessage(value: unknown): value is WireMessage {
       return typeof p.sourceUrl === "string";
     default:
       return true;
+  }
+}
+
+// ─── Wire encoding ─────────────────────────────────────────────────────────────
+// Connections use PeerJS "raw" serialization, so we frame messages ourselves. PeerJS's default
+// encoder packs every message and splits anything over 16 KB into pieces; a 64 KiB file chunk
+// became ~5 messages. Raw sends one message per chunk.
+//   control messages: JSON text
+//   file.chunk:       binary frame  [1][u32 index][u32 total][u8 idLen][mediaId][16B checksum][data]
+
+const FRAME_CHUNK = 1;
+const CHECKSUM_LEN = 16;
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+export function encodeWire(message: WireMessage): string | ArrayBuffer {
+  if (message.type !== "file.chunk") return JSON.stringify(message);
+
+  const { mediaId, index, total, data, checksum } = message.payload;
+  const id = textEncoder.encode(mediaId);
+  if (id.length > 255 || checksum.length !== CHECKSUM_LEN) throw new Error("file.chunk header out of range");
+  const header = 1 + 4 + 4 + 1 + id.length + CHECKSUM_LEN;
+  const frame = new Uint8Array(header + data.length);
+  const view = new DataView(frame.buffer);
+  frame[0] = FRAME_CHUNK;
+  view.setUint32(1, index);
+  view.setUint32(5, total);
+  frame[9] = id.length;
+  frame.set(id, 10);
+  frame.set(textEncoder.encode(checksum), 10 + id.length);
+  frame.set(data, header);
+  return frame.buffer;
+}
+
+/** Inverse of encodeWire; returns null for anything that isn't one of our frames. */
+export function decodeWire(raw: unknown): unknown {
+  try {
+    if (typeof raw === "string") return JSON.parse(raw);
+    const buffer = raw instanceof ArrayBuffer ? raw : ArrayBuffer.isView(raw) ? raw.buffer : null;
+    if (!buffer) return null;
+    const bytes = new Uint8Array(buffer, ArrayBuffer.isView(raw) ? raw.byteOffset : 0, ArrayBuffer.isView(raw) ? raw.byteLength : undefined);
+    if (bytes[0] !== FRAME_CHUNK || bytes.length < 10) return null;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const idLen = bytes[9];
+    const header = 10 + idLen + CHECKSUM_LEN;
+    if (bytes.length < header) return null;
+    return {
+      id: "",
+      type: "file.chunk",
+      sentAt: 0,
+      payload: {
+        mediaId: textDecoder.decode(bytes.subarray(10, 10 + idLen)),
+        index: view.getUint32(1),
+        total: view.getUint32(5),
+        checksum: textDecoder.decode(bytes.subarray(10 + idLen, header)),
+        data: bytes.subarray(header)
+      }
+    };
+  } catch {
+    return null;
   }
 }

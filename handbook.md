@@ -307,3 +307,13 @@ Chunks may arrive out of order; the receiver writes by index. `background` in
 - `apps/web/index.html` carries the title, description, canonical, Open Graph / Twitter tags, JSON-LD (`WebApplication`) and a crawlable fallback inside `#root` (replaced when the app mounts). The site URL (`https://sync-player-web.vercel.app`) appears in the canonical, `og:*`, JSON-LD, `public/sitemap.xml` and `public/robots.txt`: change them together if the domain changes (`src/seo.test.ts` checks they agree).
 - `public/`: `favicon.svg` is the source icon; `favicon.ico`, `favicon-*.png`, `apple-touch-icon.png`, `icon-192/512.png`, `icon-maskable-512.png` and `og-image.png` (1200x630) are rendered from it, plus `manifest.webmanifest`.
 - Invite links use `#sync=...`, which search engines ignore, so they never create duplicate pages.
+
+## 14. Stability and speed pass
+
+- **Wire format (protocol v2)**: connections use PeerJS `serialization: "raw"`. `encodeWire`/`decodeWire` in `lib/webrtc/messages.ts` send control messages as JSON text and file chunks as one binary frame (header + data), instead of PeerJS's packing and 16 KB splitting. Peers on v1 can't pair (they log "Ignored malformed message").
+- **Multi-tab safety**: each tab holds a Web Lock per transfer file (`holdFileLock`); startup cleanup skips locked files.
+- **Host room code** survives a refresh (`sessionStorage`); the remembered code is retried briefly if the broker still holds it.
+- **Wake Lock** (`useWakeLock`) during transfers; sync state is reset when the tab becomes visible.
+- **Progress** is counted in refs and published to React at most 4x/s.
+- **ArtPlayer** is loaded on first video (main bundle 515 KB -> 380 KB).
+- **Late joiners**: chunk checksums of a fully sent `File` are cached (`sentChecksums`) and reused.

@@ -22,7 +22,7 @@ import {
   Video
 } from "lucide-react";
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Artplayer from "artplayer";
+import type Artplayer from "artplayer";
 import { createActivity, formatActivity, getAllActivity, VISIBLE_ACTIVITY_LIMIT, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
 import { usePeerRoom } from "@/features/room/usePeerRoom";
 import { ActivityLogPanel } from "@/components/room/ActivityLogPanel";
@@ -45,6 +45,7 @@ import { Metric, Panel } from "@/components/ui/Panel";
 import { PendingJoinRequests } from "@/components/room/PendingJoinRequests";
 import { QrModal } from "@/components/room/QrModal";
 import { copyText } from "@/lib/ui/clipboard";
+import { useWakeLock } from "@/lib/ui/useWakeLock";
 import { describeMediaErrorCode, LOCAL_FILE_UNPLAYABLE_HINT, NO_SOURCE_HINT } from "@/lib/media/mediaErrors";
 import { getBufferedAheadSecs, predictSeekTarget, readDrift, SEEK_COST_DEFAULT_SECS, updateSeekCost } from "@/lib/sync/drift";
 import { GUEST_ACTION_LIMIT, GUEST_ACTION_WINDOW_MS } from "@/lib/sync/limits";
@@ -1331,6 +1332,11 @@ export function App() {
     const streamType =
       media.format === "hls" ? "m3u8" : media.format === "dash" ? "mpd" : null;
 
+    // ArtPlayer is loaded on first use (it is a large dependency the landing page doesn't need).
+    let cancelled = false;
+    void import("artplayer").then(({ default: Artplayer }) => {
+    if (cancelled) return;
+
     // ArtPlayer retries failed loads itself ("Reconnect: N"). That helps flaky network URLs,
     // but a local/received file (blob:) that fails will fail every time — go straight to the banner.
     Artplayer.RECONNECT_TIME_MAX = media.sourceUrl.startsWith("blob:") ? 0 : 5;
@@ -1527,8 +1533,10 @@ export function App() {
         video.removeEventListener("playing", onPlaying);
       });
     });
+    });
 
     return () => {
+      cancelled = true;
       if (artRef.current) {
         artRef.current.destroy(true);
         artRef.current = null;
@@ -1547,6 +1555,20 @@ export function App() {
   // in the background (see the late-join effect below) — that shouldn't
   // pause or lock anything, since other viewers are already watching in sync.
   const getReceivedChunks = useCallback(() => activeFileWriteRef.current?.receivedIndices, []);
+  // Keep the screen awake while a file is moving, and after the tab was hidden drop stale sync
+  // state so the guest corrects against the host's latest position straight away.
+  useWakeLock(!!room.fileSendProgress || !!room.fileReceiveProgress || !!receiveStage);
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      driftHistoryRef.current = [];
+      lastSeekAtRef.current = 0;
+      pendingSeekRef.current = null;
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, []);
+
   const isUploadLocked = room.role === "host" && !!room.fileSendProgress && !room.fileSendProgress.background;
 
   // Viewers don't pick their own media — the host mounts it (or streams the

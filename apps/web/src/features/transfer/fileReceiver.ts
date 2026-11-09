@@ -4,6 +4,7 @@ import { inferMediaKind, type LoadedMedia, type MediaFormat, type MediaKind } fr
 import { CHUNK_SIZE, type FileMeta } from "@/lib/webrtc/messages";
 import { formatBytes } from "@/lib/time/format";
 import type { FileStreamHandlers, usePeerRoom } from "@/features/room/usePeerRoom";
+import { holdFileLock } from "@/features/transfer/opfsCleanup";
 import type { ActivityLevel } from "@/features/activity-log/activityLog";
 
 // Without OPFS the whole file lives in RAM on the viewer; refuse above this size.
@@ -215,6 +216,7 @@ export function createFileReceiver(deps: FileReceiverDeps) {
 
       write.writeQueue = write.writeQueue.then(async () => {
         try {
+          holdFileLock(opfsFileName);
           const root = await navigator.storage.getDirectory();
           const handle = await root.getFileHandle(opfsFileName, { create: true });
           write.opfsFileHandle = handle;
