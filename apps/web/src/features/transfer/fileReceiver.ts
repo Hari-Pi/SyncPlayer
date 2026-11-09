@@ -30,7 +30,7 @@ export type ActiveFileWrite = {
   storageMode: "pending" | "opfs" | "memory";
   opfsFileName: string;
   opfsFileHandle: FileSystemFileHandle | null;
-  writableStream: FileSystemWritableFileStream | null;
+  writableStream: ChunkSink | null;
   memoryChunks: Map<number, ArrayBuffer>;
   writeQueue: Promise<void>;
   receivedIndices: Set<number>;
@@ -44,6 +44,43 @@ export type ActiveFileWrite = {
   /** performance.now() of the most recent chunk to arrive (for the post-end quiet-period check). */
   lastChunkAt: number;
 };
+
+/** Where received chunks are written: a main-thread OPFS stream or the worker fallback. */
+export type ChunkSink = {
+  write(position: number, data: ArrayBuffer): Promise<void>;
+  close(): Promise<void>;
+};
+
+/** Main-thread sink: FileSystemWritableFileStream (Chrome, Edge, Firefox, Safari 17+ in some contexts). */
+function streamSink(stream: FileSystemWritableFileStream): ChunkSink {
+  return {
+    write: (position, data) => stream.write({ type: "write", position, data }),
+    close: () => stream.close()
+  };
+}
+
+/** Worker sink: for browsers without createWritable. Requests are serialized by the caller's writeQueue. */
+async function openWorkerSink(name: string): Promise<ChunkSink> {
+  const worker = new Worker(new URL("../../workers/opfsWriter.ts", import.meta.url), { type: "module" });
+  const request = (message: unknown, transfer: Transferable[] = []) =>
+    new Promise<void>((resolve, reject) => {
+      worker.onmessage = (e: MessageEvent<{ type: string; error?: string }>) =>
+        e.data.type === "error" ? reject(new Error(e.data.error)) : resolve();
+      worker.onerror = (e) => reject(new Error(e.message));
+      worker.postMessage(message, transfer);
+    });
+  await request({ type: "open", name });
+  return {
+    write: (position, data) => request({ type: "write", position, data }, [data]),
+    close: async () => {
+      try {
+        await request({ type: "close" });
+      } finally {
+        worker.terminate();
+      }
+    }
+  };
+}
 
 export type FileReceiverDeps = {
   log: (level: ActivityLevel, label: string, detail: string) => void;
@@ -143,11 +180,15 @@ export function createFileReceiver(deps: FileReceiverDeps) {
         try {
           const root = await navigator.storage.getDirectory();
           const handle = await root.getFileHandle(opfsFileName, { create: true });
-          if (typeof handle.createWritable !== "function") {
-            throw new Error("OPFS writable streams are unavailable in this browser.");
-          }
           write.opfsFileHandle = handle;
-          write.writableStream = await handle.createWritable();
+          // Debug switch to exercise the worker path in browsers that do support createWritable.
+          const forceWorker = localStorage.getItem("syncplayer:forceopfsworker") === "true";
+          if (typeof handle.createWritable === "function" && !forceWorker) {
+            write.writableStream = streamSink(await handle.createWritable());
+          } else {
+            write.writableStream = await openWorkerSink(opfsFileName);
+            log("info", "FILE", "Using the worker-based file writer (this browser has no main-thread OPFS writer).");
+          }
           write.storageMode = "opfs";
         } catch (err) {
           write.storageMode = "memory";
@@ -256,11 +297,7 @@ export function createFileReceiver(deps: FileReceiverDeps) {
             }
 
             if (write.storageMode === "opfs" && write.writableStream) {
-              await write.writableStream.write({
-                type: "write",
-                position: index * CHUNK_SIZE,
-                data: chunkBuffer
-              });
+              await write.writableStream.write(index * CHUNK_SIZE, chunkBuffer);
             } else {
               write.memoryChunks.set(index, chunkBuffer);
             }

@@ -5,6 +5,7 @@ import { CHUNK_SIZE, PROTOCOL_VERSION, isWireMessage } from "@/lib/webrtc/messag
 import { GUEST_ACTION_LIMIT, GUEST_ACTION_WINDOW_MS } from "@/lib/sync/limits";
 import { smoothLatencySync } from "@/lib/wasm/syncCore";
 import { combineChecksums, rangesInclude } from "@/lib/media/checksum";
+import { inferMediaFormat } from "@/lib/media/mediaTypes";
 import { getQueuedChunkCount } from "@/lib/webrtc/peerjsCompat";
 
 type RoomRole = "solo" | "host" | "guest";
@@ -280,12 +281,10 @@ const rtcConfig: ExtendedRTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun.cloudflare.com:3478" },
+    // The old eu-0/us-0.turn.peerjs.com relays no longer resolve in DNS. This one still does, but
+    // it is a third-party demo relay with no guarantees: configure your own (see README) for reliability.
     {
-      urls: [
-        "turn:eu-0.turn.peerjs.com:3478",
-        "turn:us-0.turn.peerjs.com:3478",
-        "turn:relay.backups.cz:3478"
-      ],
+      urls: ["turn:relay.backups.cz:3478"],
       username: "peerjs",
       credential: "peerjsp"
     }
@@ -912,6 +911,11 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     [send]
   );
 
+  /** Host-side: stop blocking playback on an in-progress upload. The transfer keeps running in the background. */
+  const releaseUploadLock = useCallback(() => {
+    setFileSendProgress((prev) => (prev && !prev.background ? { ...prev, background: true } : prev));
+  }, []);
+
   /** Guest-side: ask the host to re-send whatever we are missing or failed to verify. */
   const sendFileRetry = useCallback((mediaId: string) => send("file.retry", { mediaId }), [send]);
 
@@ -995,7 +999,6 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       });
 
       const mimeType = file.type || "video/mp4";
-      const { inferMediaFormat } = await import("@/lib/media/mediaTypes");
       const format = inferMediaFormat(mimeType);
 
       const meta: FileMeta = {
@@ -1702,6 +1705,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     sendFileResume,
     sendFileRetry,
     sendFileAborted,
+    releaseUploadLock,
     sendFile
   };
 }

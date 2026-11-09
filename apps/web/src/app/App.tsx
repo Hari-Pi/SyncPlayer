@@ -1,7 +1,6 @@
 import {
   AlertTriangle,
   AudioLines,
-  Check,
   CircleDot,
   Clipboard,
   FileVideo,
@@ -20,31 +19,37 @@ import {
   Shield,
   Signal,
   Upload,
-  UserPlus,
-  Video,
-  X
+  Video
 } from "lucide-react";
-import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Artplayer from "artplayer";
-import QRCode from "qrcode";
-import { createActivity, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
-import { usePeerRoom, type PendingJoinRequest } from "@/features/room/usePeerRoom";
+import { createActivity, formatActivity, getAllActivity, VISIBLE_ACTIVITY_LIMIT, type ActivityEntry, type ActivityLevel } from "@/features/activity-log/activityLog";
+import { usePeerRoom } from "@/features/room/usePeerRoom";
 import { ActivityLogPanel } from "@/components/room/ActivityLogPanel";
 import { FileProgressBar } from "@/components/room/FileProgressBar";
 import { ChunkTransferView } from "@/components/room/ChunkTransferView";
 import { createMediaHint, type DriftReading } from "@/lib/wasm/syncCore";
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
-import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia, type MediaKind, type MediaFormat } from "@/lib/media/mediaTypes";
-import { chunkChecksum, combineChecksums, indicesToRanges } from "@/lib/media/checksum";
+import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia } from "@/lib/media/mediaTypes";
 import { createLocalTabChannel } from "@/lib/sync/localTabSync";
 import { createFileReceiver, type ActiveFileWrite } from "@/features/transfer/fileReceiver";
+import {
+  createShareUrl,
+  readSharePayloadFromUrl,
+  shareableRtcConfig,
+  writeStoredRtcConfig,
+  type ShareMedia
+} from "@/lib/share/sharePayload";
 import { cx } from "@/lib/ui/cx";
+import { Metric, Panel } from "@/components/ui/Panel";
+import { PendingJoinRequests } from "@/components/room/PendingJoinRequests";
+import { QrModal } from "@/components/room/QrModal";
+import { copyText } from "@/lib/ui/clipboard";
+import { describeMediaErrorCode, LOCAL_FILE_UNPLAYABLE_HINT, NO_SOURCE_HINT } from "@/lib/media/mediaErrors";
 import { getBufferedAheadSecs, readDrift } from "@/lib/sync/drift";
 import { GUEST_ACTION_LIMIT, GUEST_ACTION_WINDOW_MS } from "@/lib/sync/limits";
 import type { PlaybackSnapshot, FileMeta, RemoteMediaMount, PlaybackConfig, GuestPlaybackAction } from "@/lib/webrtc/messages";
-import { CHUNK_SIZE } from "@/lib/webrtc/messages";
 import type { DataConnection } from "peerjs";
-import type { FileStreamHandlers } from "@/features/room/usePeerRoom";
 
 const emptyDrift: DriftReading = {
   driftMs: 0,
@@ -76,184 +81,6 @@ const PROGRAMMATIC_SEEK_MAX_AGE_MS = 5000;
 const LOCAL_PAUSE_INTENT_GRACE_MS = 2000;
 
 
-function Panel({
-  title,
-  icon,
-  action,
-  children,
-  className
-}: {
-  title: string;
-  icon?: React.ReactNode;
-  action?: React.ReactNode;
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <section className={cx("panel", className)}>
-      <div className="panel__header">
-        <span className="panel__title">
-          {icon}
-          {title}
-        </span>
-        {action}
-        <span className="panel__rail" />
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function Metric({ label, value, tone = "normal" }: { label: string; value: string; tone?: "normal" | "ok" | "warn" }) {
-  return (
-    <div className={cx("metric", `metric--${tone}`)}>
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function PendingJoinRequests({
-  requests,
-  onAccept,
-  onDecline,
-  className
-}: {
-  requests: PendingJoinRequest[];
-  onAccept: (request: PendingJoinRequest) => void;
-  onDecline: (request: PendingJoinRequest) => void;
-  className?: string;
-}) {
-  if (requests.length === 0) {
-    return null;
-  }
-
-  return (
-    <div className={cx("pending-requests", className)}>
-      <span className="section-title">
-        <UserPlus size={11} />
-        Join Requests ({requests.length})
-      </span>
-      <ul className="pending-request-list">
-        {requests.map((request) => (
-          <li key={request.peerId} className="pending-request-item">
-            <span className="pending-request-item__label">{request.label}</span>
-            <div className="pending-request-item__actions">
-              <button
-                type="button"
-                className="pending-request-item__accept"
-                onClick={() => onAccept(request)}
-              >
-                <Check size={13} />
-                Accept
-              </button>
-              <button
-                type="button"
-                className="pending-request-item__decline"
-                onClick={() => onDecline(request)}
-              >
-                <X size={13} />
-                Decline
-              </button>
-            </div>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-function copyText(value: string) {
-  if (!value) {
-    return;
-  }
-
-  void navigator.clipboard?.writeText(value);
-}
-
-/** Human-readable explanation for the standard HTMLMediaElement error codes. */
-function describeMediaErrorCode(code: number): string {
-  switch (code) {
-    case 1:
-      return "Loading was aborted.";
-    case 2:
-      return "A network error interrupted the download.";
-    case 3:
-      return "The media could not be decoded — the file may be corrupt or use an unsupported codec.";
-    case 4:
-      return "This source isn't a supported media format, the URL is invalid, or the server refused the request.";
-    default:
-      return "Unknown media error.";
-  }
-}
-
-// readyState 0 (HAVE_NOTHING) + networkState 3 (NETWORK_NO_SOURCE) + no
-// MediaError object means the browser never got usable media data at all —
-// not a decode/format problem. In practice this is almost always the remote
-// server refusing the request outright, most commonly hotlink/Referer
-// protection (very common on streaming and file-lock CDNs, which only allow
-// their own site to embed the link), a link that requires a login/session
-// cookie, or an expired one-time URL. It's a restriction on the source's
-// side — no amount of client-side retrying gets around it.
-// Auto-reconnect attempts (2s, 4s, 8s, 16s, 16s, 16s) before handing control back to the viewer.
-const MAX_RECONNECT_ATTEMPTS = 6;
-
-const LOCAL_FILE_UNPLAYABLE_HINT =
-  "This browser can't play this file. It may be damaged, or use a format the browser doesn't support (MKV, AVI and HEVC/H.265 video often aren't). Converting it to MP4 (H.264 video, AAC audio) usually fixes it.";
-
-const NO_SOURCE_HINT =
-  "No data was received from the server at all. This is almost always the server refusing the request — common causes are " +
-  "hotlink/Referer protection (many streaming and file-lock CDNs only allow their own site to embed the link), a link that " +
-  "requires a login/session, or an expired one-time URL. This is a restriction on the source's side, not something SyncPlayer " +
-  "can bypass. Try downloading the file and using \"Select File\" instead, or use a direct link from a host that allows embedding.";
-
-
-type ShareMedia = Pick<LoadedMedia, "id" | "title" | "sourceUrl" | "kind" | "format" | "origin">;
-type ShareRtcConfig = Pick<RTCConfiguration, "iceServers" | "iceTransportPolicy">;
-type SharePayload =
-  | {
-      type: "invite";
-      offer: string;
-      media: ShareMedia | null;
-      rtcConfig?: ShareRtcConfig | null;
-    }
-  | {
-      type: "response";
-      answer: string;
-    };
-
-function encodeSharePayload(payload: SharePayload) {
-  const bytes = new TextEncoder().encode(JSON.stringify(payload));
-  let binary = "";
-
-  bytes.forEach((byte) => {
-    binary += String.fromCharCode(byte);
-  });
-
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-}
-
-function decodeSharePayload(value: string): SharePayload {
-  const normalized = value.replace(/^.*#sync=/, "").replaceAll("-", "+").replaceAll("_", "/");
-  const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
-  const binary = atob(padded);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-
-  return JSON.parse(new TextDecoder().decode(bytes)) as SharePayload;
-}
-
-function createShareUrl(payload: SharePayload) {
-  return `${window.location.origin}${window.location.pathname}#sync=${encodeSharePayload(payload)}`;
-}
-
-function readSharePayloadFromUrl() {
-  if (!window.location.hash.startsWith("#sync=")) {
-    return null;
-  }
-
-  return decodeSharePayload(window.location.hash);
-}
-
 function isLocalhost() {
   return ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
 }
@@ -261,24 +88,6 @@ function isLocalhost() {
 /** Display just the 4-digit code from a full SP-XXXX peer ID. */
 function formatRoomId(id: string) {
   return id.startsWith("SP-") ? id.slice(3) : id;
-}
-
-function readStoredRtcConfig(): ShareRtcConfig | null {
-  try {
-    const stored = localStorage.getItem("syncplayer:rtcconfig");
-    return stored ? JSON.parse(stored) as ShareRtcConfig : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeStoredRtcConfig(config: ShareRtcConfig | null) {
-  if (!config) {
-    localStorage.removeItem("syncplayer:rtcconfig");
-    return;
-  }
-
-  localStorage.setItem("syncplayer:rtcconfig", JSON.stringify(config));
 }
 
 // Off by default: connecting peers wait for explicit host approval unless
@@ -306,39 +115,8 @@ function createRemoteMedia(url: string): LoadedMedia {
   };
 }
 
-function QrModal({ url, onClose }: { url: string; onClose: () => void }) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  useEffect(() => {
-    if (!canvasRef.current || !url) return;
-
-    QRCode.toCanvas(canvasRef.current, url, {
-      width: 260,
-      margin: 2,
-      color: {
-        dark: "#37f3ff",
-        light: "#03070b"
-      }
-    }).catch(() => {
-      // silently fail
-    });
-  }, [url]);
-
-  return (
-    <div className="qr-overlay" onClick={onClose}>
-      <div className="qr-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="qr-modal__header">
-          <span className="qr-modal__title">Scan to Join</span>
-          <button type="button" className="qr-modal__close" onClick={onClose}>
-            <X size={16} />
-          </button>
-        </div>
-        <canvas ref={canvasRef} className="qr-canvas" />
-        <p className="qr-modal__hint">Open the invite link on your mobile device to join the room.</p>
-      </div>
-    </div>
-  );
-}
+// Auto-reconnect attempts (2s, 4s, 8s, 16s, 16s, 16s) before handing control back to the viewer.
+const MAX_RECONNECT_ATTEMPTS = 6;
 
 export function App() {
   const mediaRef = useRef<HTMLMediaElement | null>(null);
@@ -412,7 +190,7 @@ export function App() {
   const handledShareLinkRef = useRef(false);
   const localTabChannelRef = useRef<ReturnType<typeof createLocalTabChannel>>(null);
   const hostFileRef = useRef<File | null>(null);
-  const [guestStreamUrl, setGuestStreamUrl] = useState<string | null>(null);
+  const [, setGuestStreamUrl] = useState<string | null>(null);
   const [guestStreamMeta, setGuestStreamMeta] = useState<FileMeta | null>(null);
   // Friendly, user-facing explanation shown over the player when the current
   // media source fails to load (as opposed to the raw technical log entry).
@@ -439,7 +217,7 @@ export function App() {
   });
 
   const log = useCallback((level: ActivityLevel, label: string, detail: string) => {
-    setActivity((entries) => [createActivity(level, label, detail), ...entries]);
+    setActivity((entries) => [createActivity(level, label, detail), ...entries].slice(0, VISIBLE_ACTIVITY_LIMIT));
   }, []);
 
   // Shared by both the audio element and ArtPlayer's video error handler.
@@ -534,7 +312,9 @@ export function App() {
 
         const bufferedAheadSecs = getBufferedAheadSecs(element);
         const reading = readDrift(driftSecs, remoteSnapshot.playbackRate, bufferedAheadSecs);
-        setDrift(reading);
+        setDrift((prev) =>
+          prev.mode === reading.mode && Math.round(prev.driftMs) === Math.round(reading.driftMs) && prev.rate === reading.rate ? prev : reading
+        );
 
         // Graduated drift correction: soft/firm nudge playbackRate, seek for large drift.
         if (reading.mode === "seek") {
@@ -846,7 +626,7 @@ export function App() {
         type: "invite",
         offer,
         media: shareableMedia,
-        rtcConfig: readStoredRtcConfig()
+        rtcConfig: shareableRtcConfig()
       });
     },
     [media]
@@ -1043,7 +823,15 @@ export function App() {
       playbackRate: element.playbackRate
     };
 
-    setSnapshot(nextSnapshot);
+    // Only the duration is rendered from this state; skip re-renders for position-only changes.
+    setSnapshot((prev) =>
+      prev.mediaId === nextSnapshot.mediaId &&
+      prev.duration === nextSnapshot.duration &&
+      prev.paused === nextSnapshot.paused &&
+      prev.playbackRate === nextSnapshot.playbackRate
+        ? prev
+        : nextSnapshot
+    );
 
     if (now - lastBroadcastRef.current > 250 || isManual) {
       if (room.role === "host") {
@@ -1108,14 +896,9 @@ export function App() {
   }, [room.role, room.status, room.localOffer]);
 
   const copyActivityLogs = useCallback(() => {
-    const formattedLogs = activity
-      .slice()
-      .reverse()
-      .map((entry) => `[${entry.at}] [${entry.level.toUpperCase()}] ${entry.label}: ${entry.detail}`)
-      .join("\n");
-    copyText(formattedLogs);
-    log("ok", "SHARE", "Activity logs copied to clipboard.");
-  }, [activity, log]);
+    copyText(formatActivity(getAllActivity()));
+    log("ok", "SHARE", `Activity logs copied to clipboard (${getAllActivity().length} entries).`);
+  }, [log]);
 
   // Shared handler for pause/resume/seek. Host and solo remain the simple
   // "just broadcast" case. Guests can now have their action reverse-sync to
@@ -1996,7 +1779,7 @@ export function App() {
           </div>
 
           <Panel title="Playback Surface" icon={<Video size={15} />} className="player-panel">
-            <div className={cx("player-shell", playerLoadError && !showPlayerAnyway && "player-shell--error")}>
+            <div className={cx("player-shell", playerLoadError && !showPlayerAnyway && !isUploadLocked && "player-shell--error")}>
               {media ? (
                 media.kind === "audio" ? (
                   <div className="audio-stage">
@@ -2056,6 +1839,9 @@ export function App() {
                     Playback is locked until "{room.fileSendProgress.fileName}" ({formatBytes(room.fileSendProgress.totalBytes)}) finishes
                     sending to {room.connectedPeers.length} viewer{room.connectedPeers.length === 1 ? "" : "s"}.
                   </span>
+                  <button type="button" className="upload-lock-skip" onClick={room.releaseUploadLock}>
+                    Start playback anyway
+                  </button>
                   <div className="upload-lock-viewers">
                     {room.connectedPeers.length === 0 ? (
                       <span className="upload-lock-viewers__empty">No viewers connected yet.</span>
@@ -2085,7 +1871,7 @@ export function App() {
               {/* Shown when the current source fails to load — surfaced here
                   instead of only in the activity log, since a failed load
                   otherwise just looks like an empty/frozen player. */}
-              {playerLoadError && !showPlayerAnyway && (
+              {playerLoadError && !showPlayerAnyway && !isUploadLocked && (
                 <div className="media-load-error-overlay" role="alert">
                   <div className="media-load-error-banner">
                     <AlertTriangle size={28} />

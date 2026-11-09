@@ -289,3 +289,15 @@ Chunks may arrive out of order; the receiver writes by index. `background` in
 - **Guest**: auto-reconnect gives up after 6 attempts and shows "Retry Connection".
 - **Shared modules**: `lib/sync/drift.ts` (`readDrift`, `getBufferedAheadSecs`), `lib/sync/limits.ts`
   (guest action limit). Tests: `pnpm test` (vitest) covers drift, checksums, media inference, message validation.
+
+## 12. Later additions
+
+- **Receiving UI**: the guest's player area shows `ChunkTransferView` (canvas grid, one cell per chunk, plus received/left counts) while a file downloads; there is no separate progress bar.
+- **Playback errors**: a failed load shows an opaque banner in place of the player (`media-load-error-overlay`), with "Show player anyway". Local/received (`blob:`) files get a format/codec message, ArtPlayer's own retries are off for them, and dead-URL recovery runs once per media.
+- **Host upload lock**: `releaseUploadLock` / "Start playback anyway" turns the lock into a background transfer.
+- **Safari/iOS writer**: `workers/opfsWriter.ts` (sync access handle) is used when `createWritable` is missing; force it with `localStorage["syncplayer:forceopfsworker"] = "true"`.
+- **Logs**: the panel shows the latest 200 entries; `getAllActivity()` holds everything (Copy Logs, crash screen). `ErrorBoundary` wraps the app.
+- **Invites** leave out relay usernames/passwords unless `localStorage["syncplayer:sharecredentials"] = "true"`.
+- **Relays**: the dead `eu-0/us-0.turn.peerjs.com` servers were removed; configure your own (README).
+- **Extracted from App.tsx**: `components/ui/Panel.tsx`, `components/room/{PendingJoinRequests,QrModal}.tsx`, `lib/share/sharePayload.ts`, `lib/media/mediaErrors.ts`, `lib/ui/clipboard.ts`. QR code library loads on demand.
+- **Tooling**: `pnpm lint` (eslint), `pnpm test` (vitest), `pnpm test:e2e` (Playwright, two real tabs; needs the public PeerJS broker; set `PW_CHROMIUM_PATH` to use an installed Chromium). CI: `.github/workflows/ci.yml`.

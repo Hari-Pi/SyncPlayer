@@ -359,7 +359,7 @@ Potential next improvements include:
 ## Running Your Own Relay (TURN) Server
 
 By default SyncPlayer uses public STUN servers plus the shared PeerJS demo TURN servers
-(`peerjs` / `peerjsp`). Those are fine for trying the app but have no uptime guarantee, and
+(`peerjs` / `peerjsp`). The old `eu-0`/`us-0.turn.peerjs.com` relays no longer exist, so the one remaining relay is a third-party demo. It is fine for trying the app but have no uptime guarantee, and
 anyone behind a strict NAT depends on them. For anything you rely on, run your own
 [coturn](https://github.com/coturn/coturn) and point the app at it from the browser console:
 
@@ -372,7 +372,7 @@ localStorage.setItem("syncplayer:rtcconfig", JSON.stringify({
 }));
 ```
 
-The host's invite link carries this config to viewers automatically. To use your own PeerJS
+Invite links share only credential-free servers by default (links get pasted around and kept in history). To include relay usernames/passwords in invites, also run `localStorage.setItem("syncplayer:sharecredentials", "true")`. To use your own PeerJS
 signaling server instead of `0.peerjs.com`, set `syncplayer:peerserver` to PeerJS options such as
 `{ "host": "peer.example.com", "port": 443, "secure": true, "path": "/" }`. Reload after changing either key.
 

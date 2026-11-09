@@ -522,7 +522,7 @@ textarea {
   padding: 1.5rem;
   position: absolute;
   text-align: center;
-  z-index: 4;
+  z-index: 100;
 }
 
 .upload-lock-overlay svg {
@@ -1697,4 +1697,10 @@ textarea {
 
 .upload-lock-overlay .chunk-transfer__stats span {
   max-width: none;
+}
+
+.upload-lock-skip {
+  color: var(--muted);
+  font-size: 0.75rem;
+  margin-top: 0.2rem;
 }

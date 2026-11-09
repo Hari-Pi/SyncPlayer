@@ -12,7 +12,7 @@ export async function cleanupOrphanedOpfsFiles(): Promise<number> {
     const root = await navigator.storage.getDirectory();
     let deletedCount = 0;
 
-    // @ts-ignore - TS doesn't fully support async iterators on OPFS DirectoryHandles yet
+    // @ts-expect-error - TS doesn't fully support async iterators on OPFS DirectoryHandles yet
     for await (const [name, handle] of root.entries()) {
       if (name.startsWith("syncplayer-transfer-")) {
         try {
