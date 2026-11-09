@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://sync-player-web.vercel.app/sitemap.xml

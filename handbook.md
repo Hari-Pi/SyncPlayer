@@ -301,3 +301,9 @@ Chunks may arrive out of order; the receiver writes by index. `background` in
 - **Relays**: the dead `eu-0/us-0.turn.peerjs.com` servers were removed; configure your own (README).
 - **Extracted from App.tsx**: `components/ui/Panel.tsx`, `components/room/{PendingJoinRequests,QrModal}.tsx`, `lib/share/sharePayload.ts`, `lib/media/mediaErrors.ts`, `lib/ui/clipboard.ts`. QR code library loads on demand.
 - **Tooling**: `pnpm lint` (eslint), `pnpm test` (vitest), `pnpm test:e2e` (Playwright, two real tabs; needs the public PeerJS broker; set `PW_CHROMIUM_PATH` to use an installed Chromium). CI: `.github/workflows/ci.yml`.
+
+## 13. SEO and icons
+
+- `apps/web/index.html` carries the title, description, canonical, Open Graph / Twitter tags, JSON-LD (`WebApplication`) and a crawlable fallback inside `#root` (replaced when the app mounts). The site URL (`https://sync-player-web.vercel.app`) appears in the canonical, `og:*`, JSON-LD, `public/sitemap.xml` and `public/robots.txt`: change them together if the domain changes (`src/seo.test.ts` checks they agree).
+- `public/`: `favicon.svg` is the source icon; `favicon.ico`, `favicon-*.png`, `apple-touch-icon.png`, `icon-192/512.png`, `icon-maskable-512.png` and `og-image.png` (1200x630) are rendered from it, plus `manifest.webmanifest`.
+- Invite links use `#sync=...`, which search engines ignore, so they never create duplicate pages.

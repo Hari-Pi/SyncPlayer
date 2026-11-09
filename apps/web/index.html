@@ -13,11 +13,105 @@
       the one client-side fix that can help those sources load.
     -->
     <meta name="referrer" content="no-referrer" />
-    <title>SyncPlayer Command Deck</title>
+
+    <title>SyncPlayer: Watch Videos Together in Sync | Peer-to-Peer, No Server</title>
+    <meta
+      name="description"
+      content="Watch videos and listen to music in sync with friends. Stream local files or direct links peer-to-peer over WebRTC. No account, no server: share a 4-digit code."
+    />
+    <meta name="application-name" content="SyncPlayer" />
+    <meta name="keywords" content="watch together, synchronized video player, watch party, sync video playback, peer-to-peer, WebRTC, share local video file, HLS player, free watch party without account" />
+    <meta name="author" content="Hari-Pi" />
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1" />
+    <link rel="canonical" href="https://sync-player-web.vercel.app/" />
+
+    <meta name="theme-color" content="#03070b" />
+    <meta name="color-scheme" content="dark" />
+
+    <!-- Matches the app background so there is no grey flash before the stylesheet loads. -->
+    <style>html,body{background:#03070b}</style>
+
+    <link rel="icon" href="/favicon.ico" sizes="48x48" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32" />
+    <link rel="icon" href="/favicon-16.png" type="image/png" sizes="16x16" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="SyncPlayer" />
+    <meta property="og:title" content="SyncPlayer: Watch Videos Together in Sync" />
+    <meta
+      property="og:description"
+      content="Peer-to-peer synchronized playback for local files and direct media links. No account, no media server: share a 4-digit room code and press play together."
+    />
+    <meta property="og:url" content="https://sync-player-web.vercel.app/" />
+    <meta property="og:image" content="https://sync-player-web.vercel.app/og-image.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="SyncPlayer logo and the tagline: Watch together, in sync." />
+    <meta property="og:locale" content="en_US" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="SyncPlayer: Watch Videos Together in Sync" />
+    <meta
+      name="twitter:description"
+      content="Peer-to-peer synchronized playback for local files and direct media links. No account, no media server."
+    />
+    <meta name="twitter:image" content="https://sync-player-web.vercel.app/og-image.png" />
+    <meta name="twitter:image:alt" content="SyncPlayer logo and the tagline: Watch together, in sync." />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "SyncPlayer",
+        "url": "https://sync-player-web.vercel.app/",
+        "description": "Peer-to-peer synchronized video and audio playback over WebRTC. Share a local file or a direct media link with friends and keep playback aligned, with no account and no media server.",
+        "applicationCategory": "MultimediaApplication",
+        "operatingSystem": "Any modern web browser",
+        "browserRequirements": "Requires JavaScript and WebRTC support",
+        "image": "https://sync-player-web.vercel.app/og-image.png",
+        "isAccessibleForFree": true,
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+        "featureList": [
+          "Synchronized play, pause and seek across viewers",
+          "Local file streaming directly between browsers",
+          "Direct media URLs, HLS and MPEG-DASH streams",
+          "4-digit room codes and one-click invite links",
+          "Host approval for new viewers",
+          "Automatic drift correction and latency checks"
+        ],
+        "author": { "@type": "Person", "name": "Hari-Pi", "url": "https://hari-pi.com" },
+        "sameAs": ["https://github.com/Hari-Pi/SyncPlayer", "https://hari-pi.com/projects/syncplayer.html"]
+      }
+    </script>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!--
+        Crawlable fallback: shown to search engines, link-preview bots and users with
+        JavaScript disabled, and replaced as soon as the app mounts.
+      -->
+      <main style="max-width:42rem;margin:12vh auto;padding:0 1.25rem;font-family:ui-monospace,Menlo,monospace;color:#defbff;line-height:1.6">
+        <h1 style="color:#37f3ff;font-size:1.6rem">SyncPlayer: watch videos together, in sync</h1>
+        <p>
+          SyncPlayer keeps video and audio playback aligned between friends, straight from the browser.
+          Start a room, share the 4-digit code or invite link, and play a local file or a direct media link.
+          Everyone sees the same moment, with no account and no media server in the middle.
+        </p>
+        <h2 style="font-size:1.1rem">What it does</h2>
+        <ul>
+          <li>Synchronized play, pause and seek over WebRTC peer-to-peer connections</li>
+          <li>Streams your local video or audio file directly to viewers</li>
+          <li>Plays direct media URLs, HLS (.m3u8) and MPEG-DASH (.mpd) streams</li>
+          <li>Host approval for new viewers, automatic drift correction and live latency stats</li>
+        </ul>
+        <noscript><p>SyncPlayer needs JavaScript and a modern browser with WebRTC support to run.</p></noscript>
+        <p><a href="https://github.com/Hari-Pi/SyncPlayer" style="color:#37f3ff">Source code on GitHub</a></p>
+      </main>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-
