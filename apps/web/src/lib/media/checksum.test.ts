@@ -3,7 +3,26 @@ import { chunkChecksum, combineChecksums, fnv1aHash, indicesToRanges, rangesIncl
 
 const bytes = (...n: number[]) => new Uint8Array(n);
 
+// The original BigInt implementation: sender and receiver must keep agreeing with it.
+function referenceFnv(data: Uint8Array): string {
+  let hash = 14695981039346656037n;
+  for (const byte of data) {
+    hash = (hash ^ BigInt(byte)) & 0xffffffffffffffffn;
+    hash = (hash * 1099511628211n) & 0xffffffffffffffffn;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
 describe("checksums", () => {
+  it("matches the BigInt reference on random and edge-case inputs", () => {
+    const inputs = [bytes(), bytes(0), bytes(255), new Uint8Array(1000).fill(255)];
+    for (let n = 0; n < 50; n++) {
+      const len = Math.floor(Math.random() * 300);
+      inputs.push(Uint8Array.from({ length: len }, () => Math.floor(Math.random() * 256)));
+    }
+    for (const input of inputs) expect(fnv1aHash(input)).toBe(referenceFnv(input));
+  });
+
   it("matches the known FNV-1a 64 value for an empty input", () => {
     expect(fnv1aHash(bytes())).toBe("cbf29ce484222325");
   });

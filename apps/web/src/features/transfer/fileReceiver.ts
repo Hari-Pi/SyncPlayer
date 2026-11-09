@@ -32,7 +32,10 @@ export type ActiveFileWrite = {
   opfsFileHandle: FileSystemFileHandle | null;
   writableStream: ChunkSink | null;
   memoryChunks: Map<number, ArrayBuffer>;
+  /** Settles when every chunk handed over so far has been stored (or failed). */
   writeQueue: Promise<void>;
+  /** Settles once the storage backend (worker, stream or memory) has been chosen. */
+  sinkReady: Promise<void>;
   receivedIndices: Set<number>;
   chunkChecksums: Map<number, string>;
   pendingHostChecksum: string | null;
@@ -47,33 +50,45 @@ export type ActiveFileWrite = {
   pendingWrites: number;
 };
 
-/** Where received chunks are written: a main-thread OPFS stream or the worker fallback. */
+/** Where received chunks go: verified, then written at their slot. */
 export type ChunkSink = {
-  write(position: number, data: ArrayBuffer): Promise<void>;
+  /** Resolves false if the chunk failed verification (it is then not written). */
+  store(index: number, data: ArrayBuffer, checksum: string): Promise<boolean>;
   close(): Promise<void>;
 };
 
-/** Main-thread sink: FileSystemWritableFileStream (Chrome, Edge, Firefox, Safari 17+ in some contexts). */
-function streamSink(stream: FileSystemWritableFileStream): ChunkSink {
-  return {
-    write: (position, data) => stream.write({ type: "write", position, data }),
-    close: () => stream.close()
-  };
-}
-
-/** Worker sink: for browsers without createWritable. Requests are serialized by the caller's writeQueue. */
+/** Default: a worker verifies and writes via a sync access handle; many chunks in flight at once. */
 async function openWorkerSink(name: string): Promise<ChunkSink> {
   const worker = new Worker(new URL("../../workers/opfsWriter.ts", import.meta.url), { type: "module" });
-  const request = (message: unknown, transfer: Transferable[] = []) =>
-    new Promise<void>((resolve, reject) => {
-      worker.onmessage = (e: MessageEvent<{ type: string; error?: string }>) =>
-        e.data.type === "error" ? reject(new Error(e.data.error)) : resolve();
-      worker.onerror = (e) => reject(new Error(e.message));
-      worker.postMessage(message, transfer);
+  const pending = new Map<number, { resolve: (ok: boolean) => void; reject: (err: Error) => void }>();
+  let nextId = 0;
+  const failAll = (err: Error) => {
+    pending.forEach((p) => p.reject(err));
+    pending.clear();
+  };
+  worker.onmessage = (e: MessageEvent<{ id: number; ok?: boolean; error?: string }>) => {
+    const request = pending.get(e.data.id);
+    if (!request) return;
+    pending.delete(e.data.id);
+    if (e.data.error) request.reject(new Error(e.data.error));
+    else request.resolve(!!e.data.ok);
+  };
+  worker.onerror = (e) => failAll(new Error(e.message || "file writer worker crashed"));
+  const request = (message: Record<string, unknown>, transfer: Transferable[] = []) =>
+    new Promise<boolean>((resolve, reject) => {
+      const id = nextId++;
+      pending.set(id, { resolve, reject });
+      worker.postMessage({ ...message, id }, transfer);
     });
-  await request({ type: "open", name });
+
+  try {
+    await request({ type: "open", name });
+  } catch (err) {
+    worker.terminate();
+    throw err;
+  }
   return {
-    write: (position, data) => request({ type: "write", position, data }, [data]),
+    store: (index, data, checksum) => request({ type: "store", index, position: index * CHUNK_SIZE, data, checksum }, [data]),
     close: async () => {
       try {
         await request({ type: "close" });
@@ -81,6 +96,20 @@ async function openWorkerSink(name: string): Promise<ChunkSink> {
         worker.terminate();
       }
     }
+  };
+}
+
+/** Fallback: main-thread createWritable stream. Verifies here; writes are serialized. */
+function streamSink(stream: FileSystemWritableFileStream): ChunkSink {
+  let tail: Promise<unknown> = Promise.resolve();
+  return {
+    store: (index, data, checksum) => {
+      if (chunkChecksum(index, new Uint8Array(data)) !== checksum) return Promise.resolve(false);
+      const written = tail.then(() => stream.write({ type: "write", position: index * CHUNK_SIZE, data }));
+      tail = written.catch(() => undefined);
+      return written.then(() => true);
+    },
+    close: () => tail.then(() => stream.close())
   };
 }
 
@@ -171,6 +200,7 @@ export function createFileReceiver(deps: FileReceiverDeps) {
         writableStream: null,
         memoryChunks: new Map(),
         writeQueue: Promise.resolve(),
+        sinkReady: Promise.resolve(),
         receivedIndices: new Set(),
         chunkChecksums: new Map(),
         pendingHostChecksum: null,
@@ -188,13 +218,15 @@ export function createFileReceiver(deps: FileReceiverDeps) {
           const root = await navigator.storage.getDirectory();
           const handle = await root.getFileHandle(opfsFileName, { create: true });
           write.opfsFileHandle = handle;
-          // Debug switch to exercise the worker path in browsers that do support createWritable.
-          const forceWorker = localStorage.getItem("syncplayer:forceopfsworker") === "true";
-          if (typeof handle.createWritable === "function" && !forceWorker) {
-            write.writableStream = streamSink(await handle.createWritable());
-          } else {
+          // Debug switch to exercise the main-thread fallback in browsers where the worker works.
+          const forceStream = localStorage.getItem("syncplayer:forcestreamwriter") === "true";
+          try {
+            if (forceStream) throw new Error("main-thread writer forced");
             write.writableStream = await openWorkerSink(opfsFileName);
-            log("info", "FILE", "Using the worker-based file writer (this browser has no main-thread OPFS writer).");
+          } catch (workerErr) {
+            if (typeof handle.createWritable !== "function") throw workerErr;
+            write.writableStream = streamSink(await handle.createWritable());
+            log("info", "FILE", `Using the main-thread file writer (${workerErr instanceof Error ? workerErr.message : String(workerErr)}).`);
           }
           write.storageMode = "opfs";
         } catch (err) {
@@ -215,6 +247,7 @@ export function createFileReceiver(deps: FileReceiverDeps) {
           );
         }
       });
+      write.sinkReady = write.writeQueue;
     }
 
     // Tell the host what we already have (empty ranges for a fresh transfer,
@@ -291,6 +324,49 @@ export function createFileReceiver(deps: FileReceiverDeps) {
       });
     };
 
+    const storeChunk = async (index: number, buffer: ArrayBuffer, checksum: string) => {
+      if (write.aborted || write.finalized) {
+        write.pendingWrites -= 1;
+        return;
+      }
+      let ok: boolean;
+      try {
+        if (write.storageMode === "opfs" && write.writableStream) {
+          ok = await write.writableStream.store(index, buffer, checksum);
+        } else {
+          ok = chunkChecksum(index, new Uint8Array(buffer)) === checksum;
+          if (ok) write.memoryChunks.set(index, buffer);
+        }
+      } catch (err) {
+        write.pendingWrites -= 1;
+        if (write.aborted) return;
+        const reason = err instanceof Error ? err.message : String(err);
+        log("error", "FILE", `Failed to write chunk ${index}: ${reason}. The download was stopped; rejoin the room to try again.`);
+        write.aborted = true;
+        setGuestStreamMeta(null);
+        roomRef.current?.sendFileAborted(write.mediaId, `disk write failed: ${reason}`);
+        return;
+      }
+      write.pendingWrites -= 1;
+
+      // A bad chunk is dropped (not marked received) so the retry path re-requests it.
+      if (!ok) {
+        log("warn", "FILE", `Chunk ${index} of "${write.fileName}" failed verification and was discarded.`);
+        return;
+      }
+      if (write.aborted || write.finalized) return;
+
+      write.receivedIndices.add(index);
+      write.chunkChecksums.set(index, checksum);
+
+      if (write.endReceived && write.receivedIndices.size >= write.totalChunks) {
+        finalizeFile();
+      } else if (write.endReceived && performance.now() - lastStageAt > 250) {
+        lastStageAt = performance.now();
+        setReceiveStage(savingStage());
+      }
+    };
+
     return {
       alreadyReceivedCount: write.receivedIndices.size,
       onChunk: (index, _total, data, checksum) => {
@@ -298,45 +374,11 @@ export function createFileReceiver(deps: FileReceiverDeps) {
         write.lastChunkAt = performance.now();
         write.pendingWrites += 1;
 
-        write.writeQueue = write.writeQueue.then(async () => {
-          write.pendingWrites -= 1;
-          if (write.aborted || write.finalized) return;
-          try {
-            const chunk = new Uint8Array(data.byteLength);
-            chunk.set(data);
-            const chunkBuffer = chunk.buffer as ArrayBuffer;
-
-            // Re-hash what actually arrived and compare with the sender's per-chunk checksum.
-            // A bad chunk is dropped (not marked received) so the retry path re-requests it.
-            if (chunkChecksum(index, chunk) !== checksum) {
-              log("warn", "FILE", `Chunk ${index} of "${write.fileName}" failed verification and was discarded.`);
-              return;
-            }
-
-            if (write.storageMode === "opfs" && write.writableStream) {
-              await write.writableStream.write(index * CHUNK_SIZE, chunkBuffer);
-            } else {
-              write.memoryChunks.set(index, chunkBuffer);
-            }
-          } catch (err) {
-            const reason = err instanceof Error ? err.message : String(err);
-            log("error", "FILE", `Failed to write chunk ${index}: ${reason}. The download was stopped; rejoin the room to try again.`);
-            write.aborted = true;
-            setGuestStreamMeta(null);
-            roomRef.current?.sendFileAborted(write.mediaId, `disk write failed: ${reason}`);
-            return;
-          }
-
-          write.receivedIndices.add(index);
-          write.chunkChecksums.set(index, checksum);
-
-          if (write.endReceived && write.receivedIndices.size >= write.totalChunks) {
-            finalizeFile();
-          } else if (write.endReceived && performance.now() - lastStageAt > 250) {
-            lastStageAt = performance.now();
-            setReceiveStage(savingStage());
-          }
-        });
+        // Own copy of the bytes (PeerJS may hand us a view into a larger buffer) so it can be
+        // transferred to the writer worker. Stores run concurrently; the sink handles ordering.
+        const buffer = data.slice().buffer;
+        const stored = write.sinkReady.then(() => storeChunk(index, buffer, checksum));
+        write.writeQueue = Promise.all([write.writeQueue, stored]).then(() => undefined);
       },
       onEnd: (checksum) => {
         if (write.aborted) return;

@@ -295,7 +295,7 @@ Chunks may arrive out of order; the receiver writes by index. `background` in
 - **Receiving UI**: the guest's player area shows `ChunkTransferView` (canvas grid, one cell per chunk, plus received/left counts) while a file downloads; there is no separate progress bar.
 - **Playback errors**: a failed load shows an opaque banner in place of the player (`media-load-error-overlay`), with "Show player anyway". Local/received (`blob:`) files get a format/codec message, ArtPlayer's own retries are off for them, and dead-URL recovery runs once per media.
 - **Host upload lock**: `releaseUploadLock` / "Start playback anyway" turns the lock into a background transfer.
-- **Safari/iOS writer**: `workers/opfsWriter.ts` (sync access handle) is used when `createWritable` is missing; force it with `localStorage["syncplayer:forceopfsworker"] = "true"`.
+- **Receiver writes**: chunks go to `workers/opfsWriter.ts`, which verifies each checksum and writes it via a sync access handle, many in flight at once. If the worker can't open the file it falls back to the main-thread `createWritable` stream (force with `localStorage["syncplayer:forcestreamwriter"] = "true"`), then to memory. `fnv1aHash` uses 32-bit integer math (same output as the old BigInt version, pinned by a unit test).
 - **Logs**: the panel shows the latest 200 entries; `getAllActivity()` holds everything (Copy Logs, crash screen). `ErrorBoundary` wraps the app.
 - **Invites** leave out relay usernames/passwords unless `localStorage["syncplayer:sharecredentials"] = "true"`.
 - **Relays**: the dead `eu-0/us-0.turn.peerjs.com` servers were removed; configure your own (README).

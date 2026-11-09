@@ -62,24 +62,27 @@ test("guest receives a file and the integrity check passes", async ({ context })
 
 test("a corrupted chunk is discarded and re-requested", async ({ context }) => {
   const { guest } = await setup(context, () => {
+    // The receiver copies each chunk with slice() before handing it to the writer worker,
+    // which verifies it: flip a byte in the first full-size copy.
     let done = false;
-    const orig = Uint8Array.prototype.set;
-    Uint8Array.prototype.set = function (src: ArrayLike<number>, off?: number) {
-      orig.call(this, src, off);
-      if (!done && src.length === 65536 && this.length === 65536) {
+    const orig = Uint8Array.prototype.slice;
+    Uint8Array.prototype.slice = function (this: Uint8Array, ...args: [number?, number?]) {
+      const copy = orig.apply(this, args) as Uint8Array;
+      if (!done && args.length === 0 && copy.length === 65536) {
         done = true;
-        this[100] ^= 0xff;
+        copy[100] ^= 0xff;
       }
-    };
+      return copy;
+    } as typeof Uint8Array.prototype.slice;
   });
   await expect(guest.getByText(/failed verification/i).first()).toBeVisible({ timeout: 60_000 });
   await expect(guest.getByText(/asking the host to re-send/i).first()).toBeVisible({ timeout: 30_000 });
   await expect(guest.getByText(/integrity check passed/i).first()).toBeVisible({ timeout: 60_000 });
 });
 
-test("the worker-based file writer completes a transfer", async ({ context }) => {
-  const { guest } = await setup(context, () => localStorage.setItem("syncplayer:forceopfsworker", "true"));
-  await expect(guest.getByText(/worker-based file writer/i).first()).toBeVisible({ timeout: 60_000 });
+test("the main-thread fallback file writer completes a transfer", async ({ context }) => {
+  const { guest } = await setup(context, () => localStorage.setItem("syncplayer:forcestreamwriter", "true"));
+  await expect(guest.getByText(/main-thread file writer/i).first()).toBeVisible({ timeout: 60_000 });
   await expect(guest.getByText(/integrity check passed/i).first()).toBeVisible({ timeout: 60_000 });
 });
 
