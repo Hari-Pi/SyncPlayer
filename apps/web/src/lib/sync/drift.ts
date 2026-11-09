@@ -53,3 +53,22 @@ export function readDrift(driftSecs: number, hostRate: number, bufferedAheadSecs
   }
   return { driftMs, mode: "seek", rate: hostRate };
 }
+
+// ─── Predictive seeking ────────────────────────────────────────────────────────
+// A seek isn't instant: the player has to decode from the previous keyframe and rebuffer (the
+// spinner). Seeking to where the host is *now* lands behind by that much, which can trigger
+// another seek — a catch-up loop. So we measure how long seeks take on this device and aim
+// where the host will be once the seek completes.
+export const SEEK_COST_DEFAULT_SECS = 0.3;
+export const SEEK_COST_MAX_SECS = 3;
+
+/** Where to seek so playback resumes level with the host. */
+export function predictSeekTarget(hostTarget: number, hostRate: number, hostPaused: boolean, seekCostSecs: number): number {
+  return hostPaused ? hostTarget : hostTarget + seekCostSecs * hostRate;
+}
+
+/** Fold a measured seek duration (seconds) into the running estimate. */
+export function updateSeekCost(previousSecs: number, measuredSecs: number): number {
+  const measured = Math.min(Math.max(measuredSecs, 0), SEEK_COST_MAX_SECS);
+  return previousSecs * 0.5 + measured * 0.5;
+}

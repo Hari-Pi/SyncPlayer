@@ -54,11 +54,30 @@ test("guest follows host playback of a real video file", async ({ context }) => 
   console.log("playing", h, g);
   expect(Math.abs(h.t - g.t)).toBeLessThan(0.6);
 
+  // Simulate a slower receiver (e.g. a phone): seeks take longer to decode/rebuffer, which is
+  // what used to cause a catch-up loop (seek -> spinner -> host moved on -> seek again).
+  // Measured inside the guest page (its own drift reading), since cross-page timing is skewed
+  // when one page is throttled.
+  const cdp = await context.newCDPSession(guest);
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: Number(process.env.SYNC_THROTTLE ?? 6) });
+  await guest.evaluate(() => {
+    const w = window as unknown as { __seeks: number; __modes: string[] };
+    w.__seeks = 0;
+    w.__modes = [];
+    document.querySelector(".artplayer-container video")!.addEventListener("seeking", () => w.__seeks++);
+    setInterval(() => w.__modes.push(document.querySelector(".status-pill")?.textContent ?? ""), 250);
+  });
   await video(host).evaluate((v: HTMLVideoElement) => { v.currentTime = 60; });
-  await host.waitForTimeout(4000);
-  const [h2, g2] = await Promise.all([state(host), state(guest)]);
-  console.log("after seek", h2, g2);
-  expect(Math.abs(h2.t - g2.t)).toBeLessThan(0.6);
+  await host.waitForTimeout(15_000);
+  const { seeks, modes } = await guest.evaluate(() => {
+    const w = window as unknown as { __seeks: number; __modes: string[] };
+    return { seeks: w.__seeks, modes: w.__modes };
+  });
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 1 });
+  const settled = modes.slice(-8); // last ~2 s
+  console.log("after host jump:", { guestSeeks: seeks, driftModes: modes.join(" ") });
+  expect(seeks).toBeLessThanOrEqual(2);
+  expect(settled.some((m) => /seek/i.test(m))).toBe(false);
 
   await video(host).evaluate((v: HTMLVideoElement) => v.pause());
   await expect.poll(async () => (await state(guest)).paused, { timeout: 15_000 }).toBe(true);

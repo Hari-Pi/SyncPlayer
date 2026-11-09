@@ -46,7 +46,7 @@ import { PendingJoinRequests } from "@/components/room/PendingJoinRequests";
 import { QrModal } from "@/components/room/QrModal";
 import { copyText } from "@/lib/ui/clipboard";
 import { describeMediaErrorCode, LOCAL_FILE_UNPLAYABLE_HINT, NO_SOURCE_HINT } from "@/lib/media/mediaErrors";
-import { getBufferedAheadSecs, readDrift } from "@/lib/sync/drift";
+import { getBufferedAheadSecs, predictSeekTarget, readDrift, SEEK_COST_DEFAULT_SECS, updateSeekCost } from "@/lib/sync/drift";
 import { GUEST_ACTION_LIMIT, GUEST_ACTION_WINDOW_MS } from "@/lib/sync/limits";
 import type { PlaybackSnapshot, FileMeta, RemoteMediaMount, PlaybackConfig, GuestPlaybackAction } from "@/lib/webrtc/messages";
 import type { DataConnection } from "peerjs";
@@ -79,6 +79,9 @@ const PROGRAMMATIC_SEEK_MAX_AGE_MS = 5000;
 // to comfortably cover one full round trip even at the slowest adaptive
 // broadcast cadence (up to 1000ms) plus normal latency.
 const LOCAL_PAUSE_INTENT_GRACE_MS = 2000;
+
+// Give up waiting on a correction seek that never reported back after this long.
+const PENDING_SEEK_TIMEOUT_MS = 8000;
 
 
 function isLocalhost() {
@@ -148,6 +151,10 @@ export function App() {
   // position against this tracked target (rather than relying on elapsed
   // time) disambiguates correctly regardless of how long the seek took.
   const lastProgrammaticSeekRef = useRef<{ target: number; setAt: number } | null>(null);
+  // Guest-side predictive seeking: how long a correction seek takes on this device (smoothed),
+  // and the correction seek currently settling, if any (no new seek starts until it has).
+  const seekCostRef = useRef(SEEK_COST_DEFAULT_SECS);
+  const pendingSeekRef = useRef<{ startedAt: number } | null>(null);
   // Guest-side: the paused/playing state the viewer just chose locally (via
   // click or hotkey), and when. A viewer's own pause/resume must win locally
   // no matter what — but the host doesn't know about it yet for at least one
@@ -286,6 +293,14 @@ export function App() {
     mediaRef.current = node;
   }, []);
 
+  // A correction seek has settled once the player can play again: record how long it took.
+  const settlePendingSeek = useCallback((element: HTMLMediaElement) => {
+    const pending = pendingSeekRef.current;
+    if (!pending || element.seeking || element.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return;
+    pendingSeekRef.current = null;
+    seekCostRef.current = updateSeekCost(seekCostRef.current, (performance.now() - pending.startedAt) / 1000);
+  }, []);
+
   const handleRemotePlayback = useCallback(
     async (remoteSnapshot: PlaybackSnapshot, latencyMs: number) => {
       const element = mediaRef.current;
@@ -336,7 +351,12 @@ export function App() {
         const pausedOffset = remoteSnapshot.paused && element.paused && reading.mode !== "hold";
         if (reading.mode === "seek" || pausedOffset) {
           const now = performance.now();
-          const recovering = isStalledRef.current || now - lastSeekAtRef.current < SEEK_COOLDOWN_MS;
+          // A previous correction that never reported back (e.g. the element was swapped) stops blocking after a while.
+          if (pendingSeekRef.current && now - pendingSeekRef.current.startedAt > PENDING_SEEK_TIMEOUT_MS) {
+            pendingSeekRef.current = null;
+          }
+          const recovering =
+            isStalledRef.current || !!pendingSeekRef.current || now - lastSeekAtRef.current < SEEK_COOLDOWN_MS;
 
           if (recovering) {
             // Already mid-stall or mid-recovery from a previous seek — seeking
@@ -344,10 +364,20 @@ export function App() {
             // finish. Hold rate and let the current correction settle.
             element.playbackRate = remoteSnapshot.playbackRate;
           } else {
-            element.currentTime = targetPosition;
+            // Land where the host will be when this seek finishes, not where it is now.
+            const seekTo = predictSeekTarget(targetPosition, remoteSnapshot.playbackRate, remoteSnapshot.paused, seekCostRef.current);
+            element.currentTime = seekTo;
             element.playbackRate = remoteSnapshot.playbackRate;
             lastSeekAtRef.current = now;
-            lastProgrammaticSeekRef.current = { target: targetPosition, setAt: now };
+            if (!remoteSnapshot.paused) pendingSeekRef.current = { startedAt: now };
+            lastProgrammaticSeekRef.current = { target: seekTo, setAt: now };
+            log(
+              "info",
+              "SYNC",
+              remoteSnapshot.paused
+                ? `Drift ${(driftSecs * 1000).toFixed(0)} ms while paused: jumped to the host's position.`
+                : `Drift ${(driftSecs * 1000).toFixed(0)} ms: seeking ${(seekTo - targetPosition).toFixed(2)} s ahead of the host to allow for this device's seek time (${seekCostRef.current.toFixed(2)} s).`
+            );
             driftHistoryRef.current = [];
           }
         } else {
@@ -1460,12 +1490,20 @@ export function App() {
 
       const onPlay = () => handleResumeRef.current();
       const onPause = () => handlePauseRef.current();
-      const onSeeked = () => handleSeekedRef.current();
+      const onSeeked = () => {
+        settlePendingSeek(video);
+        handleSeekedRef.current();
+      };
+      const onCanPlay = () => settlePendingSeek(video);
       const onRateChange = () => publishSnapshotRef.current(true);
       const onLoadedMetadata = () => handleLoadedMetadataRef.current();
       const onWaiting = () => { isStalledRef.current = true; };
-      const onPlaying = () => { isStalledRef.current = false; };
+      const onPlaying = () => {
+        isStalledRef.current = false;
+        settlePendingSeek(video);
+      };
 
+      video.addEventListener("canplay", onCanPlay);
       video.addEventListener("play", onPlay);
       video.addEventListener("pause", onPause);
       video.addEventListener("seeked", onSeeked);
@@ -1479,6 +1517,7 @@ export function App() {
       }
 
       art.on("destroy", () => {
+        video.removeEventListener("canplay", onCanPlay);
         video.removeEventListener("play", onPlay);
         video.removeEventListener("pause", onPause);
         video.removeEventListener("seeked", onSeeked);
@@ -1825,11 +1864,12 @@ export function App() {
                       onLoadedMetadata={handleLoadedMetadata}
                       onPlay={handleResume}
                       onPause={handlePause}
-                      onSeeked={handleSeeked}
+                      onSeeked={(e) => { settlePendingSeek(e.currentTarget); handleSeeked(); }}
+                      onCanPlay={(e) => settlePendingSeek(e.currentTarget)}
                       onRateChange={() => publishSnapshot(true)}
                       onTimeUpdate={() => publishSnapshot(false)}
                       onWaiting={() => { isStalledRef.current = true; }}
-                      onPlaying={() => { isStalledRef.current = false; }}
+                      onPlaying={(e) => { isStalledRef.current = false; settlePendingSeek(e.currentTarget); }}
                       onError={() => reportMediaError("AUDIO", mediaRef.current)}
                     />
                   </div>
