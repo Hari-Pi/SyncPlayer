@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Peer, DataConnection, type PeerJSOption } from "peerjs";
 import type { PlaybackSnapshot, WireMessage, FileMeta, RemoteMediaMount, PlaybackConfig, GuestPlaybackAction } from "@/lib/webrtc/messages";
-import { CHUNK_SIZE } from "@/lib/webrtc/messages";
+import { CHUNK_SIZE, PROTOCOL_VERSION, isWireMessage } from "@/lib/webrtc/messages";
+import { GUEST_ACTION_LIMIT, GUEST_ACTION_WINDOW_MS } from "@/lib/sync/limits";
 import { smoothLatencySync } from "@/lib/wasm/syncCore";
 import { combineChecksums, rangesInclude } from "@/lib/media/checksum";
 import { getQueuedChunkCount } from "@/lib/webrtc/peerjsCompat";
@@ -70,6 +71,8 @@ type PeerRoomOptions = {
   onConfigRequest?: (conn: DataConnection) => void;
   onConfigState?: (config: PlaybackConfig) => void;
   onConfigChanged?: () => void;
+  /** Host-side: a viewer asked for the missing/corrupt chunks of a file to be re-sent. */
+  onFileRetry?: (mediaId: string, peerId: string) => void;
   /** Host-side: a viewer performed a rate-limited pause/resume/seek and it passed the host's own limit check. */
   onGuestAction?: (action: GuestPlaybackAction, snapshot: PlaybackSnapshot, peerId: string) => void;
   /**
@@ -227,6 +230,52 @@ function setupConnectionDiagnostics(
   });
 }
 
+const SIGNALING_MAX_RECONNECTS = 8;
+
+/**
+ * The public broker drops idle clients. Established data channels keep working, but a
+ * host that has lost the broker can no longer be joined, so re-register with backoff.
+ */
+function attachSignalingRecovery(peer: Peer, log: (level: "info" | "ok" | "warn" | "error", label: string, detail: string) => void) {
+  let attempts = 0;
+  let looping = false;
+
+  const step = () => {
+    if (peer.destroyed || !peer.disconnected) {
+      looping = false;
+      return;
+    }
+    if (attempts >= SIGNALING_MAX_RECONNECTS) {
+      looping = false;
+      log("error", "PEERJS", "Lost the signaling broker and could not reconnect. Existing viewers keep playing, but nobody new can join until you restart the room.");
+      return;
+    }
+    const delay = Math.min(1000 * 2 ** attempts, 15000);
+    attempts += 1;
+    log("warn", "PEERJS", `Signaling broker connection lost. Reconnecting in ${delay / 1000}s (attempt ${attempts}/${SIGNALING_MAX_RECONNECTS})...`);
+    window.setTimeout(() => {
+      if (peer.destroyed || !peer.disconnected) {
+        looping = false;
+        return;
+      }
+      try {
+        peer.reconnect();
+      } catch { /* checked again by the next step */ }
+      window.setTimeout(step, 5000);
+    }, delay);
+  };
+
+  peer.on("open", () => {
+    attempts = 0;
+    looping = false;
+  });
+  peer.on("disconnected", () => {
+    if (looping) return;
+    looping = true;
+    step();
+  });
+}
+
 const rtcConfig: ExtendedRTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
@@ -272,14 +321,6 @@ type PeerHealthState = {
   healthyStreak: number;
 };
 
-// ─── Guest control rate limiting ──────────────────────────────────────────────
-// Viewers can pause/seek and have it reverse-sync to the host; pause and seek
-// share one budget so a viewer can't spam controls to annoy the room. Resume
-// is exempt (see below) so pausing never leaves a guest stuck. Enforced
-// host-side (authoritative) in addition to whatever client-side gate the
-// sender applies, since the sender's own check can't be trusted on its own.
-const GUEST_ACTION_LIMIT = 3;
-const GUEST_ACTION_WINDOW_MS = 60_000;
 
 // ─── File transfer tuning ──────────────────────────────────────────────────────
 // How long a fresh file.meta send waits for a peer's "file.resume" reply
@@ -297,23 +338,35 @@ const PROGRESS_ECHO_INTERVAL_MS = 250;
 // long so it doesn't sit open and cluttering the UI indefinitely.
 const PENDING_REQUEST_TIMEOUT_MS = 2 * 60 * 1000;
 
-/** Wait until conn's bufferedAmount drops below the low watermark. */
-function waitForDrain(conn: DataConnection): Promise<void> {
+/** How long a channel may sit above the low watermark before we give up on that viewer. */
+const SEND_STALL_TIMEOUT_MS = 15_000;
+
+type DrainResult = "drained" | "closed" | "timeout";
+
+/** Wait until conn's send buffers drain below the low watermark; gives up if the channel closes or stalls too long. */
+function waitForDrain(conn: DataConnection, timeoutMs = SEND_STALL_TIMEOUT_MS): Promise<DrainResult> {
   return new Promise((resolve) => {
-    const channel = conn.dataChannel ?? null;
-    const peerBufferSize = getQueuedChunkCount(conn);
-    if (!channel || (channel.bufferedAmount < FLOW_LOW_WATERMARK && peerBufferSize === 0)) {
-      resolve();
+    const startedAt = performance.now();
+    const check = (): DrainResult | null => {
+      if (!conn.open) return "closed";
+      const channel = conn.dataChannel ?? null;
+      if (!channel) return "drained";
+      if (channel.bufferedAmount < FLOW_LOW_WATERMARK && getQueuedChunkCount(conn) === 0) return "drained";
+      if (performance.now() - startedAt > timeoutMs) return "timeout";
+      return null;
+    };
+
+    const first = check();
+    if (first) {
+      resolve(first);
       return;
     }
-
-    channel.bufferedAmountLowThreshold = FLOW_LOW_WATERMARK;
+    if (conn.dataChannel) conn.dataChannel.bufferedAmountLowThreshold = FLOW_LOW_WATERMARK;
     const interval = setInterval(() => {
-      const buffered = channel.bufferedAmount;
-      const queued = getQueuedChunkCount(conn);
-      if (buffered < FLOW_LOW_WATERMARK && queued === 0) {
+      const result = check();
+      if (result) {
         clearInterval(interval);
-        resolve();
+        resolve(result);
       }
     }, 50);
   });
@@ -324,7 +377,7 @@ function genRoomCode(): string {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
 
-export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged, onGuestAction, allowAllConnections }: PeerRoomOptions) {
+export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged, onGuestAction, onFileRetry, allowAllConnections }: PeerRoomOptions) {
   const [role, setRole] = useState<RoomRole>("solo");
   const [status, setStatus] = useState<LinkStatus>("idle");
   const [localOffer, setLocalOffer] = useState("");
@@ -338,7 +391,10 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   // Host-side: connections awaiting an explicit accept/decline decision.
   const [pendingRequests, setPendingRequests] = useState<PendingJoinRequest[]>([]);
 
-  const peerId = useMemo(() => `SP-${genRoomCode()}`, []);
+  // Room code is chosen per hosting attempt (it is regenerated if the broker says it is taken).
+  const [peerId, setPeerId] = useState(() => `SP-${genRoomCode()}`);
+  const hostIdRef = useRef(peerId);
+  const hostAttemptRef = useRef(0);
 
 
   // Stable callback refs — prevent stale closures in DataChannel listeners
@@ -350,6 +406,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const onConfigStateRef = useRef(onConfigState);
   const onConfigChangedRef = useRef(onConfigChanged);
   const onGuestActionRef = useRef(onGuestAction);
+  const onFileRetryRef = useRef(onFileRetry);
   const allowAllConnectionsRef = useRef(allowAllConnections);
   // role changes rarely, but handleMessage's closure is long-lived (bound to
   // DataConnection listeners at connect-time), so it needs a ref rather than
@@ -364,8 +421,9 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     onConfigStateRef.current = onConfigState;
     onConfigChangedRef.current = onConfigChanged;
     onGuestActionRef.current = onGuestAction;
+    onFileRetryRef.current = onFileRetry;
     allowAllConnectionsRef.current = allowAllConnections;
-  }, [onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged, onGuestAction, allowAllConnections]);
+  }, [onPlaybackState, onEvent, onFileStream, onMediaMount, onConfigRequest, onConfigState, onConfigChanged, onGuestAction, onFileRetry, allowAllConnections]);
   useEffect(() => {
     roleRef.current = role;
   }, [role]);
@@ -410,6 +468,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const pendingTimeoutsRef = useRef<Map<string, number>>(new Map());
 
   const closeRoom = useCallback(() => {
+    hostAttemptRef.current += 1; // invalidates any host start still awaiting the broker
     onEventRef.current("info", "ROOM", "Initiating room closure. Terminating all peer connections.");
     connectionsRef.current.forEach((conn) => {
       onEventRef.current("info", "WEBRTC", `Closing connection to peer: ${conn.peer}`);
@@ -532,9 +591,26 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
 
   const handleMessage = useCallback(
     (conn: DataConnection, eventData: unknown) => {
-      const message = eventData as WireMessage;
+      if (!isWireMessage(eventData)) {
+        onEventRef.current("warn", "WEBRTC", `Ignored malformed message from ${conn.peer}.`);
+        return;
+      }
+      const message = eventData;
+
+      try {
 
       if (message.type === "room.hello") {
+        const theirVersion = message.payload.version;
+        if (theirVersion !== undefined && theirVersion !== PROTOCOL_VERSION) {
+          onEventRef.current(
+            "error",
+            "ROOM",
+            `${message.payload.label} runs protocol v${theirVersion}, this app speaks v${PROTOCOL_VERSION}. Both sides need the same app version — refresh and try again.`
+          );
+          if (roleRef.current === "guest") setStatus("declined");
+          conn.close();
+          return;
+        }
         setRemotePeer((prev) =>
           prev === "Awaiting peer" ? message.payload.label : prev.includes(message.payload.label) ? prev : `${prev}, ${message.payload.label}`
         );
@@ -670,6 +746,24 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         return;
       }
 
+      if (message.type === "file.aborted" && roleRef.current === "host") {
+        // A viewer's receive pipeline died (e.g. its disk write failed): stop showing it as downloading.
+        onEventRef.current("warn", "FILE", `${conn.peer} stopped receiving: ${message.payload.reason ?? "unknown reason"}.`);
+        setPeerFileProgress((prev) => {
+          if (!(conn.peer in prev)) return prev;
+          const next = { ...prev };
+          delete next[conn.peer];
+          return next;
+        });
+        return;
+      }
+
+      if (message.type === "file.retry") {
+        onEventRef.current("info", "FILE", `${conn.peer} asked for missing chunks of ${message.payload.mediaId} to be re-sent.`);
+        onFileRetryRef.current?.(message.payload.mediaId, conn.peer);
+        return;
+      }
+
       if (message.type === "file.aborted") {
         // Guest-side: the host's send pipeline died mid-transfer. Let the
         // in-progress receive handlers clean up instead of sitting at
@@ -795,6 +889,9 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         onGuestActionRef.current?.(message.payload.action, message.payload.snapshot, peerKey);
         return;
       }
+      } catch (err) {
+        onEventRef.current("error", "WEBRTC", `Failed handling ${message.type} from ${conn.peer}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
     [sendToOne]
   );
@@ -811,6 +908,19 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
   const sendGuestAction = useCallback(
     (action: GuestPlaybackAction, snapshot: PlaybackSnapshot) => {
       send("playback.guestAction", { action, snapshot });
+    },
+    [send]
+  );
+
+  /** Guest-side: ask the host to re-send whatever we are missing or failed to verify. */
+  const sendFileRetry = useCallback((mediaId: string) => send("file.retry", { mediaId }), [send]);
+
+  /** Guest-side: tell the host our receive pipeline died so it stops counting us as downloading. */
+  const sendFileAborted = useCallback(
+    (mediaId: string, reason?: string) => {
+      fileStreamHandlersRef.current.delete(mediaId);
+      setFileReceiveProgress((prev) => (prev?.mediaId === mediaId ? null : prev));
+      send("file.aborted", { mediaId, reason });
     },
     [send]
   );
@@ -851,8 +961,14 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       const generation = ++sendGenerationCounterRef.current;
       const targetPeerIdSet = Array.from(new Set(conns.map((c) => c.peer)));
       targetPeerIdSet.forEach((peerId) => peerTransferStateRef.current.set(peerId, { generation, mediaId }));
+      // "Current" means not superseded by a newer sendFile() for the same peer. A peer's entry
+      // is also deleted when it disconnects; that is NOT a supersede — the send loop then drops
+      // the peer itself and the transfer settles normally (clearing the host's upload lock).
       const isCurrent = () =>
-        targetPeerIdSet.every((peerId) => peerTransferStateRef.current.get(peerId)?.generation === generation);
+        targetPeerIdSet.every((peerId) => {
+          const state = peerTransferStateRef.current.get(peerId);
+          return !state || state.generation === generation;
+        });
 
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
@@ -953,17 +1069,24 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         `Starting blob transfer of "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB) to ${conns.length} peer connection(s)`
       );
 
-      const chunkQueue: Array<{ index: number; total: number; data: Uint8Array; checksum: string }> = [];
-      // Per-chunk checksums, kept independent of the queue above (which drains
+      // Per-chunk checksums, kept independent of the per-peer queues (which drain
       // as chunks are sent) so we can compute a whole-file integrity check —
       // see combineChecksums — once every chunk has been produced.
       const chunkChecksums = new Map<number, string>();
-      let drainActive = false;
-      let endSent = false;
+
+      type QueuedChunk = { index: number; total: number; data: Uint8Array; checksum: string; worker: Worker; pending: number };
+      // One queue and one send loop PER PEER: a slow viewer only delays itself (until the
+      // workers' bounded read-ahead window fills), and a dead one is dropped after a stall timeout.
+      const peerQueues = new Map<string, QueuedChunk[]>();
+      for (const peerId of peerConns.keys()) peerQueues.set(peerId, []);
+      const peerRunning = new Set<string>();
+      const peerFinished = new Set<string>();
+      const droppedPeers = new Set<string>();
 
       let workersActive = 0;
       let workersDone = 0;
       let workerError: string | null = null;
+      let settled = false;
 
       // All workers created below, so a failure can terminate every one of
       // them instead of leaving survivors running in the background against
@@ -984,77 +1107,111 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       };
 
       await new Promise<void>((resolve, reject) => {
-        const rejectTransfer = (error: unknown) => reject(error);
-        const peerConnIndex = new Map<string, number>();
+        const settle = (action: () => void) => {
+          if (settled) return;
+          settled = true;
+          terminateAllWorkers();
+          action();
+        };
 
-        const drainQueue = async () => {
-          if (drainActive) return;
-          drainActive = true;
+        // A chunk is done once every peer that needed it has been handed it (or dropped).
+        // Only then does its worker get a credit to read further ahead.
+        const finishChunk = (chunk: QueuedChunk) => {
+          chunk.worker.postMessage({ type: "credit", n: 1 });
+          setFileSendProgress((prev) => (prev ? { ...prev, chunksSent: prev.chunksSent + 1 } : prev));
+        };
+        const release = (chunk: QueuedChunk) => {
+          if (--chunk.pending === 0) finishChunk(chunk);
+        };
+
+        const checkDone = () => {
+          if (peerFinished.size + droppedPeers.size < peerQueues.size) return;
+          if (peerFinished.size > 0) onEventRef.current("ok", "FILE", `File "${file.name}" fully sent.`);
+          else onEventRef.current("error", "FILE", `File "${file.name}" could not be delivered to any viewer.`);
+          settle(resolve);
+        };
+
+        const dropPeer = (peerId: string, reason: string) => {
+          if (droppedPeers.has(peerId) || peerFinished.has(peerId)) return;
+          droppedPeers.add(peerId);
+          const queue = peerQueues.get(peerId)!;
+          queue.splice(0).forEach(release);
+          onEventRef.current("warn", "FILE", `${peerId}: stopped sending (${reason}). They can rejoin to resume.`);
+          setPeerFileProgress((prev) => {
+            if (!(peerId in prev)) return prev;
+            const next = { ...prev };
+            delete next[peerId];
+            return next;
+          });
+          checkDone();
+        };
+
+        const runPeer = async (peerId: string) => {
+          if (peerRunning.has(peerId) || peerFinished.has(peerId) || droppedPeers.has(peerId)) return;
+          peerRunning.add(peerId);
 
           try {
-            while (chunkQueue.length > 0) {
+            const queue = peerQueues.get(peerId)!;
+            const connections = peerConns.get(peerId)!;
+            let rr = 0;
+
+            // Chunks are spread round-robin over the peer's multiplexed channels. Order
+            // doesn't matter: the receiver writes each chunk at its own byte offset.
+            while (queue.length > 0) {
               if (!isCurrent()) {
-                resolve();
+                settle(resolve);
                 return;
               }
 
-              const chunk = chunkQueue.shift()!;
-
-              // Send to each peer via round-robin over their available multiplexed
-              // connections. Order doesn't need to match chunk index — the receiver
-              // writes each chunk to its own byte offset in OPFS, so there's no
-              // correctness reason to keep this queue sorted by index.
-              for (const [peerId, connections] of peerConns.entries()) {
-                const skipRanges = peerSkipRanges.get(peerId);
-                if (skipRanges && rangesInclude(skipRanges, chunk.index)) {
-                  continue;
-                }
-
-                const openConns = connections.filter(c => c.open);
-                if (openConns.length === 0) continue;
-
-                let cIdx = peerConnIndex.get(peerId) || 0;
-                let conn = openConns[cIdx % openConns.length];
-                peerConnIndex.set(peerId, cIdx + 1);
-
-                const channel = conn.dataChannel ?? null;
-                if (channel && channel.bufferedAmount > FLOW_HIGH_WATERMARK) {
-                  await waitForDrain(conn);
-                }
-                sendToOne(conn, "file.chunk", {
-                  mediaId,
-                  index: chunk.index,
-                  total: chunk.total,
-                  data: chunk.data,
-                  checksum: chunk.checksum
-                });
+              const openConns = connections.filter((c) => c.open);
+              if (openConns.length === 0) {
+                dropPeer(peerId, "all channels closed");
+                return;
               }
-              setFileSendProgress((prev) =>
-                prev ? { ...prev, chunksSent: prev.chunksSent + 1 } : prev
-              );
+
+              const conn = openConns[rr++ % openConns.length];
+              const channel = conn.dataChannel ?? null;
+              if (channel && channel.bufferedAmount > FLOW_HIGH_WATERMARK) {
+                const drained = await waitForDrain(conn);
+                if (drained === "timeout") {
+                  dropPeer(peerId, `send buffer stalled for ${SEND_STALL_TIMEOUT_MS / 1000}s`);
+                  return;
+                }
+                if (drained === "closed") continue; // re-pick among the channels still open
+              }
+
+              const chunk = queue.shift()!;
+              sendToOne(conn, "file.chunk", {
+                mediaId,
+                index: chunk.index,
+                total: chunk.total,
+                data: chunk.data,
+                checksum: chunk.checksum
+              });
+              release(chunk);
             }
 
-            if (workersDone === workersActive && !endSent && chunkQueue.length === 0) {
-              endSent = true;
-              const fileChecksum = combineChecksums(chunkChecksums, totalChunks);
-              for (const [, connections] of peerConns.entries()) {
-                const firstOpen = connections.find(c => c.open);
-                if (!firstOpen) continue;
-                await waitForDrain(firstOpen);
-                sendToOne(firstOpen, "file.end", { mediaId, checksum: fileChecksum });
-                await waitForDrain(firstOpen);
+            // Queue empty. If every chunk has been produced, this peer is complete.
+            if (workersDone === workersActive) {
+              const firstOpen = connections.find((c) => c.open);
+              if (!firstOpen) {
+                dropPeer(peerId, "all channels closed");
+                return;
               }
-              onEventRef.current("ok", "FILE", `File "${file.name}" fully sent.`);
-              resolve();
+              sendToOne(firstOpen, "file.end", { mediaId, checksum: combineChecksums(chunkChecksums, totalChunks) });
+              await waitForDrain(firstOpen);
+              peerFinished.add(peerId);
+              checkDone();
             }
           } catch (error) {
-            rejectTransfer(error);
+            settle(() => reject(error));
           } finally {
-            drainActive = false;
-            if (isCurrent() && (chunkQueue.length > 0 || (workersDone === workersActive && !endSent))) {
-              void drainQueue();
-            }
+            peerRunning.delete(peerId);
           }
+        };
+
+        const kickAll = () => {
+          for (const peerId of peerQueues.keys()) void runPeer(peerId);
         };
 
         const NUM_WORKERS = Math.min(navigator.hardwareConcurrency || 4, 8);
@@ -1066,8 +1223,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
           const endChunkIndex = Math.min(startChunkIndex + chunksPerWorker, totalChunks);
 
           if (startChunkIndex >= totalChunks) {
-             workersActive--;
-             continue;
+            workersActive--;
+            continue;
           }
 
           const worker = new Worker(
@@ -1077,8 +1234,9 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
           workers.push(worker);
 
           worker.onmessage = (event: MessageEvent) => {
+            if (settled) return;
             if (!isCurrent()) {
-              worker.terminate();
+              settle(resolve);
               return;
             }
 
@@ -1086,34 +1244,41 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
             if (msg.type === "ready") return;
             if (msg.type === "error") {
               workerError = msg.error as string;
-              terminateAllWorkers();
               notifyPeersAborted(workerError);
-              reject(new Error(workerError));
+              settle(() => reject(new Error(workerError!)));
               return;
             }
             if (msg.type === "chunk") {
               const index = msg.index as number;
               const checksum = msg.checksum as string;
               chunkChecksums.set(index, checksum);
-              chunkQueue.push({
+              const chunk: QueuedChunk = {
                 index,
                 total: msg.total as number,
                 data: msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data as ArrayLike<number>),
-                checksum
-              });
-              void drainQueue();
+                checksum,
+                worker,
+                pending: 0
+              };
+              for (const [peerId, queue] of peerQueues) {
+                if (droppedPeers.has(peerId)) continue;
+                const skipRanges = peerSkipRanges.get(peerId);
+                if (skipRanges && rangesInclude(skipRanges, index)) continue;
+                queue.push(chunk);
+                chunk.pending++;
+              }
+              if (chunk.pending === 0) finishChunk(chunk);
+              else kickAll();
             }
             if (msg.type === "worker_done") {
               workersDone++;
-              worker.terminate();
-              void drainQueue();
+              kickAll();
             }
           };
 
           worker.onerror = (err) => {
-            terminateAllWorkers();
             notifyPeersAborted(err.message);
-            reject(new Error(err.message));
+            settle(() => reject(new Error(err.message)));
           };
 
           worker.postMessage({
@@ -1126,6 +1291,9 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
             totalChunks
           });
         }
+
+        // Nothing to read (empty file): no worker will ever report in, so finish the peers now.
+        if (workersActive === 0) kickAll();
       }).catch((err: unknown) => {
         if (isCurrent()) {
           onEventRef.current("error", "FILE", `File transfer failed: ${err instanceof Error ? err.message : "unknown error"}`);
@@ -1159,10 +1327,10 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
         id: crypto.randomUUID(),
         type: "room.hello",
         sentAt: performance.now(),
-        payload: { peerId, label: `Host (${peerId.slice(3, 7)})` }
+        payload: { peerId: hostIdRef.current, label: `Host (${hostIdRef.current.slice(3, 7)})`, version: PROTOCOL_VERSION }
       });
     },
-    [handleMessage, peerId]
+    [handleMessage]
   );
 
   /** Reject a connection: let the guest know why, then close it. */
@@ -1208,14 +1376,44 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
 
   const createHostOffer = useCallback(async () => {
     closeRoom();
+    const attemptToken = hostAttemptRef.current;
     setRole("host");
     setStatus("pairing");
-    setLocalOffer(peerId);
 
-    onEventRef.current("info", "PEERJS", `Initializing room owner node. Host Peer ID: ${peerId}`);
+    // Only 9000 four-digit codes exist on a shared broker, so a clash is plausible: retry with a fresh code.
+    const MAX_CODE_ATTEMPTS = 5;
+    let peer: Peer | null = null;
+    for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS && !peer; attempt++) {
+      const candidate = attempt === 0 ? hostIdRef.current : `SP-${genRoomCode()}`;
+      setLocalOffer(candidate);
+      onEventRef.current("info", "PEERJS", `Initializing room owner node. Host Peer ID: ${candidate}`);
+      const candidatePeer = createPeer(candidate);
+      try {
+        await waitForPeerOpen(candidatePeer);
+        peer = candidatePeer;
+        hostIdRef.current = candidate;
+        setPeerId(candidate);
+      } catch (err) {
+        candidatePeer.destroy();
+        const errType = (err as { type?: string }).type;
+        if (errType === "unavailable-id" && attempt < MAX_CODE_ATTEMPTS - 1) {
+          onEventRef.current("warn", "PEERJS", `Room code ${candidate} is already taken. Picking another...`);
+          continue;
+        }
+        setStatus("failed");
+        onEventRef.current("error", "PEERJS", `Could not start host room: ${err instanceof Error ? describeConnectionError(err) : "unknown error"}`);
+        return "";
+      }
+    }
 
-    const peer = createPeer(peerId);
+    if (!peer) return "";
+    if (hostAttemptRef.current !== attemptToken) {
+      // The room was closed while we were still waiting on the broker.
+      peer.destroy();
+      return "";
+    }
     peerRef.current = peer;
+    attachSignalingRecovery(peer, onEventRef.current);
 
     peer.on("open", (id) => {
       onEventRef.current("ok", "PEERJS", `Connected to signaling broker. Room ID: ${id}`);
@@ -1322,16 +1520,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
       setStatus("failed");
     });
 
-    try {
-      await waitForPeerOpen(peer);
-    } catch (err) {
-      setStatus("failed");
-      onEventRef.current("error", "PEERJS", `Could not start host room: ${err instanceof Error ? describeConnectionError(err) : "unknown error"}`);
-      return "";
-    }
-
-    return peerId;
-  }, [closeRoom, handleMessage, peerId, acceptConnection, declineConnection, respondToJoinRequest]);
+    return hostIdRef.current;
+  }, [closeRoom, handleMessage, acceptConnection, declineConnection, respondToJoinRequest]);
 
   const joinWithOffer = useCallback(
     async (rawId: string) => {
@@ -1411,7 +1601,7 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
                 id: crypto.randomUUID(),
                 type: "room.hello",
                 sentAt: performance.now(),
-                payload: { peerId: guestId, label: `Viewer (${guestId.slice(9)})` }
+                payload: { peerId: guestId, label: `Viewer (${guestId.slice(9)})`, version: PROTOCOL_VERSION }
               });
             });
 
@@ -1510,6 +1700,8 @@ export function usePeerRoom({ onPlaybackState, onEvent, onFileStream, onMediaMou
     reportSyncHealth,
     sendGuestAction,
     sendFileResume,
+    sendFileRetry,
+    sendFileAborted,
     sendFile
   };
 }

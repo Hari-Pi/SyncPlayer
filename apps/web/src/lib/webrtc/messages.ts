@@ -21,6 +21,9 @@ export type FileMeta = {
 
 export const CHUNK_SIZE = 64 * 1024;
 
+/** Bump when the wire format changes incompatibly; peers on different versions refuse to pair. */
+export const PROTOCOL_VERSION = 1;
+
 export type PlaybackConfig = {
   subtitleTrack: number; // -1 = off, 0+ = embedded track index
   qualityLevel: number;  // -1 = auto ABR, 0+ = level/representation index
@@ -43,6 +46,8 @@ export type WireMessage =
       payload: {
         peerId: string;
         label: string;
+        /** Absent on builds that predate versioning. */
+        version?: number;
       };
     }
   | {
@@ -125,9 +130,19 @@ export type WireMessage =
       id: string;
       type: "file.aborted";
       sentAt: number;
+      /** host→guest: the send pipeline died. guest→host: the receive pipeline died (e.g. disk write failed). */
       payload: {
         mediaId: string;
         reason?: string;
+      };
+    }
+  | {
+      id: string;
+      type: "file.retry";
+      sentAt: number;
+      /** guest→host: some received chunks failed verification; please re-send what's missing (file.resume tells which). */
+      payload: {
+        mediaId: string;
       };
     }
   | {
@@ -171,3 +186,42 @@ export type WireMessage =
     };
 
 export type GuestPlaybackAction = "pause" | "resume" | "seek";
+
+const KNOWN_TYPES = new Set<string>([
+  "room.hello", "room.joinDeclined", "playback.state", "clock.ping", "clock.pong",
+  "file.meta", "file.chunk", "media.mount", "file.end", "file.resume", "file.progress",
+  "file.aborted", "file.retry", "config.request", "config.state", "config.changed",
+  "sync.health", "playback.guestAction"
+]);
+
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
+
+/** Structural check on data arriving off the wire, before any handler touches it. */
+export function isWireMessage(value: unknown): value is WireMessage {
+  if (!isObj(value) || typeof value.type !== "string" || !KNOWN_TYPES.has(value.type) || !isObj(value.payload)) {
+    return false;
+  }
+  const p = value.payload;
+  switch (value.type) {
+    case "file.chunk":
+      return typeof p.mediaId === "string" && Number.isInteger(p.index) && typeof p.total === "number" &&
+        (p.data instanceof Uint8Array || p.data instanceof ArrayBuffer) && typeof p.checksum === "string";
+    case "file.meta":
+      return typeof p.mediaId === "string" && typeof p.fileName === "string" &&
+        typeof p.fileSize === "number" && Number.isInteger(p.totalChunks) && (p.totalChunks as number) >= 0;
+    case "file.end": case "file.aborted": case "file.retry": case "file.progress": case "file.resume":
+      return typeof p.mediaId === "string" && (value.type !== "file.resume" || Array.isArray(p.receivedRanges));
+    case "playback.state":
+      return typeof p.position === "number" && typeof p.paused === "boolean" && typeof p.playbackRate === "number";
+    case "playback.guestAction":
+      return (p.action === "pause" || p.action === "resume" || p.action === "seek") && isObj(p.snapshot);
+    case "clock.ping": case "clock.pong":
+      return typeof p.pingId === "string";
+    case "sync.health":
+      return typeof p.stalled === "boolean";
+    case "media.mount":
+      return typeof p.sourceUrl === "string";
+    default:
+      return true;
+  }
+}

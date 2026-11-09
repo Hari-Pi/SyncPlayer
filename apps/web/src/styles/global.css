@@ -576,7 +576,17 @@ textarea {
   border-radius: 2px;
   height: 5px;
   overflow: hidden;
+  position: relative;
   width: 100%;
+}
+
+.upload-lock-viewer-row--active .upload-lock-viewer-row__bar::after {
+  animation: transfer-activity 1.15s linear infinite;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.32), transparent);
+  content: "";
+  inset: 0;
+  position: absolute;
+  transform: translateX(-100%);
 }
 
 .upload-lock-viewer-row__fill {
@@ -1152,6 +1162,16 @@ textarea {
   background: rgba(55, 243, 255, 0.12);
   border-radius: 2px;
   overflow: hidden;
+  position: relative;
+}
+
+.stream-progress-wrap--active .stream-progress-bar::after {
+  animation: transfer-activity 1.15s linear infinite;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.32), transparent);
+  content: "";
+  inset: 0;
+  position: absolute;
+  transform: translateX(-100%);
 }
 
 .stream-progress-bar__fill {
@@ -1161,6 +1181,11 @@ textarea {
   border-radius: 2px;
   transition: width 0.3s ease;
   will-change: width;
+}
+
+@keyframes transfer-activity {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
 }
 
 /* ── Allow All Connections toggle ─────────────────────────────────────────── */

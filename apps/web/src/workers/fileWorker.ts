@@ -10,7 +10,9 @@ import { chunkChecksum } from "@/lib/media/checksum";
 
 type WorkerInMessage =
   | { type: "start"; file: File; mediaId: string; chunkSize: number; startChunkIndex: number; endChunkIndex: number; totalChunks: number }
-  | { type: "cancel" };
+  | { type: "cancel" }
+  // Backpressure: the main thread grants one credit per chunk it has finished with.
+  | { type: "credit"; n: number };
 
 export type WorkerOutMessage =
   | { type: "ready" }
@@ -19,22 +21,40 @@ export type WorkerOutMessage =
   | { type: "error"; mediaId: string; error: string };
 
 let canceled = false;
+// The worker may run at most `credits` chunks ahead of the main thread, so a slow
+// network can't make us buffer the whole file in memory. Initial window below.
+let credits = 0;
+let wake: (() => void) | null = null;
+const INITIAL_CREDITS = 32; // 32 x 64 KiB = 2 MiB in flight per worker
 
 self.onmessage = async (e: MessageEvent<WorkerInMessage>) => {
   const msg = e.data;
 
   if (msg.type === "cancel") {
     canceled = true;
+    wake?.();
+    return;
+  }
+
+  if (msg.type === "credit") {
+    credits += msg.n;
+    wake?.();
     return;
   }
 
   if (msg.type === "start") {
     canceled = false;
+    credits += INITIAL_CREDITS;
     const { file, mediaId, chunkSize, startChunkIndex, endChunkIndex, totalChunks } = msg;
 
     try {
       for (let i = startChunkIndex; i < endChunkIndex; i++) {
+        while (credits <= 0 && !canceled) {
+          await new Promise<void>((resolve) => { wake = resolve; });
+          wake = null;
+        }
         if (canceled) break;
+        credits--;
 
         const start = i * chunkSize;
         const end = Math.min(start + chunkSize, file.size);

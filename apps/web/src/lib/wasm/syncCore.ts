@@ -1,3 +1,5 @@
+import { fnv1aHash } from "@/lib/media/checksum";
+
 export type DriftReading = {
   driftMs: number;
   mode: "hold" | "soft" | "firm" | "seek";
@@ -15,7 +17,7 @@ export async function createMediaHint(sizeBytes: number, durationSecs: number, m
   view.setFloat64(8, durationSecs, true);
   view.setFloat64(16, modifiedMs, true);
 
-  return fnv1aHashSync(data) + fnv1aHashSync(new Uint8Array([...data].reverse()));
+  return fnv1aHash(data) + fnv1aHash(new Uint8Array([...data].reverse()));
 }
 
 /**
@@ -30,20 +32,4 @@ export function smoothLatencySync(samples: number[]): number {
     ema = ALPHA * samples[i] + (1 - ALPHA) * ema;
   }
   return ema;
-}
-
-/**
- * FNV-1a 64-bit hash — JS BigInt implementation.
- * Returns a 16-char lowercase hex string.
- */
-function fnv1aHashSync(data: Uint8Array): string {
-  const FNV_OFFSET = 14695981039346656037n;
-  const FNV_PRIME = 1099511628211n;
-  const MASK = 0xFFFFFFFFFFFFFFFFn;
-  let hash = FNV_OFFSET;
-  for (const byte of data) {
-    hash = (hash ^ BigInt(byte)) & MASK;
-    hash = (hash * FNV_PRIME) & MASK;
-  }
-  return hash.toString(16).padStart(16, "0");
 }

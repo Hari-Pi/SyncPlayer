@@ -9,7 +9,8 @@
     "build:web": "pnpm --filter @syncplayer/web build",
     "dev": "pnpm --filter @syncplayer/web dev",
     "dev:https": "pnpm --filter @syncplayer/web dev:https",
-    "typecheck": "pnpm --filter @syncplayer/web typecheck"
+    "typecheck": "pnpm --filter @syncplayer/web typecheck",
+    "test": "pnpm --filter @syncplayer/web test"
   },
   "packageManager": "pnpm@11.1.3",
   "engines": {

@@ -34,9 +34,12 @@ import { FileProgressBar } from "@/components/room/FileProgressBar";
 import { createMediaHint, type DriftReading } from "@/lib/wasm/syncCore";
 import { formatBytes, formatClock, formatDuration } from "@/lib/time/format";
 import { inferMediaFormat, inferMediaKind, mediaFormatLabel, type LoadedMedia, type MediaKind, type MediaFormat } from "@/lib/media/mediaTypes";
-import { combineChecksums, indicesToRanges } from "@/lib/media/checksum";
+import { chunkChecksum, combineChecksums, indicesToRanges } from "@/lib/media/checksum";
 import { createLocalTabChannel } from "@/lib/sync/localTabSync";
+import { createFileReceiver, type ActiveFileWrite } from "@/features/transfer/fileReceiver";
 import { cx } from "@/lib/ui/cx";
+import { getBufferedAheadSecs, readDrift } from "@/lib/sync/drift";
+import { GUEST_ACTION_LIMIT, GUEST_ACTION_WINDOW_MS } from "@/lib/sync/limits";
 import type { PlaybackSnapshot, FileMeta, RemoteMediaMount, PlaybackConfig, GuestPlaybackAction } from "@/lib/webrtc/messages";
 import { CHUNK_SIZE } from "@/lib/webrtc/messages";
 import type { DataConnection } from "peerjs";
@@ -47,22 +50,6 @@ const emptyDrift: DriftReading = {
   mode: "hold",
   rate: 1
 };
-
-// Drift magnitude thresholds (milliseconds). Drive the meter's mode/tone and
-// the actual correction applied to guests: soft/firm nudge playbackRate, seek
-// for large drift.
-const DRIFT_HOLD_MS = 40;
-const DRIFT_SOFT_MS = 150;
-const DRIFT_FIRM_MS = 500;
-const SOFT_RATE = 0.05;
-const FIRM_RATE = 0.1;
-
-// A guest that's behind the host and needs to speed up to catch back
-// up will burn through its buffer faster — if the buffer ahead is already
-// thin, that's exactly what causes a stall, which then triggers another
-// correction (the "endless catching" problem). Below this many seconds of
-// buffer ahead, we hold instead of speeding up and let the buffer refill.
-const MIN_SAFE_BUFFER_SECS = 1.5;
 
 // After a hard seek, give the player time to actually rebuffer before
 // allowing another seek. Otherwise a slow connection sees seek → stall →
@@ -87,50 +74,6 @@ const PROGRAMMATIC_SEEK_MAX_AGE_MS = 5000;
 // broadcast cadence (up to 1000ms) plus normal latency.
 const LOCAL_PAUSE_INTENT_GRACE_MS = 2000;
 
-// Viewers can pause/seek and reverse-sync that to the host; the two share one
-// budget per rolling window so a viewer can't spam controls and annoy the
-// rest of the room. Resume is exempt (see handlePlaybackAction). The host
-// enforces this too (see usePeerRoom), this client-side copy just avoids
-// sending doomed actions.
-const GUEST_ACTION_LIMIT = 3;
-const GUEST_ACTION_WINDOW_MS = 60_000;
-
-/** Seconds of buffered media ahead of the element's current playback position. */
-function getBufferedAheadSecs(element: HTMLMediaElement): number {
-  const { buffered, currentTime } = element;
-  for (let i = 0; i < buffered.length; i++) {
-    if (buffered.start(i) <= currentTime && currentTime <= buffered.end(i)) {
-      return buffered.end(i) - currentTime;
-    }
-  }
-  return 0;
-}
-
-// Compute a DriftReading from the signed offset between local currentTime and
-// the remote target position (both in seconds). Returns the correction
-// multiplier relative to the host rate — applied to guests each tick.
-function readDrift(driftSecs: number, hostRate: number, bufferedAheadSecs: number): DriftReading {
-  const driftMs = driftSecs * 1000;
-  const abs = Math.abs(driftMs);
-
-  if (abs < DRIFT_HOLD_MS) {
-    return { driftMs, mode: "hold", rate: hostRate };
-  }
-
-  // Negative drift means we're behind the target and would need to speed up.
-  const needsSpeedUp = driftMs < 0;
-  if (needsSpeedUp && bufferedAheadSecs < MIN_SAFE_BUFFER_SECS && abs < DRIFT_FIRM_MS) {
-    return { driftMs, mode: "hold", rate: hostRate };
-  }
-
-  if (abs < DRIFT_SOFT_MS) {
-    return { driftMs, mode: "soft", rate: hostRate * (driftMs > 0 ? 1 - SOFT_RATE : 1 + SOFT_RATE) };
-  }
-  if (abs < DRIFT_FIRM_MS) {
-    return { driftMs, mode: "firm", rate: hostRate * (driftMs > 0 ? 1 - FIRM_RATE : 1 + FIRM_RATE) };
-  }
-  return { driftMs, mode: "seek", rate: hostRate };
-}
 
 function Panel({
   title,
@@ -251,36 +194,15 @@ function describeMediaErrorCode(code: number): string {
 // their own site to embed the link), a link that requires a login/session
 // cookie, or an expired one-time URL. It's a restriction on the source's
 // side — no amount of client-side retrying gets around it.
+// Auto-reconnect attempts (2s, 4s, 8s, 16s, 16s, 16s) before handing control back to the viewer.
+const MAX_RECONNECT_ATTEMPTS = 6;
+
 const NO_SOURCE_HINT =
   "No data was received from the server at all. This is almost always the server refusing the request — common causes are " +
   "hotlink/Referer protection (many streaming and file-lock CDNs only allow their own site to embed the link), a link that " +
   "requires a login/session, or an expired one-time URL. This is a restriction on the source's side, not something SyncPlayer " +
   "can bypass. Try downloading the file and using \"Select File\" instead, or use a direct link from a host that allows embedding.";
 
-/**
- * Guest-side state for one incoming file transfer's OPFS write session.
- * Lives in a ref (activeFileWriteRef) rather than a closure-local variable so
- * a repeat "file.meta" for the same mediaId — e.g. the host re-streaming to a
- * peer that just reconnected — can detect and resume it instead of tearing
- * down and re-downloading everything from scratch.
- */
-type ActiveFileWrite = {
-  mediaId: string;
-  fileName: string;
-  totalChunks: number;
-  kind: MediaKind;
-  format: MediaFormat;
-  opfsFileName: string;
-  opfsFileHandle: FileSystemFileHandle | null;
-  writableStream: FileSystemWritableFileStream | null;
-  writeQueue: Promise<void>;
-  receivedIndices: Set<number>;
-  chunkChecksums: Map<number, string>;
-  pendingHostChecksum: string | null;
-  endReceived: boolean;
-  finalized: boolean;
-  aborted: boolean;
-};
 
 type ShareMedia = Pick<LoadedMedia, "id" | "title" | "sourceUrl" | "kind" | "format" | "origin">;
 type ShareRtcConfig = Pick<RTCConfiguration, "iceServers" | "iceTransportPolicy">;
@@ -695,178 +617,23 @@ export function App() {
   // have a live (unfinished, unaborted) write session for — e.g. the host
   // re-streaming to us after a reconnect — we reuse that session instead of
   // starting over, and tell the host which chunks to skip re-sending.
-  const handleFileStream = useCallback((meta: FileMeta): FileStreamHandlers => {
-    const existing = activeFileWriteRef.current;
-    const isSameMedia = !!existing && existing.mediaId === meta.mediaId && !existing.aborted;
-
-    // We already have the whole file and it's mounted (e.g. a redundant
-    // late-join re-send, or reconnecting shortly after finishing). Don't
-    // wipe a completed download and restart from zero — just tell the host
-    // we have everything and leave our existing state alone.
-    if (isSameMedia && existing!.finalized) {
-      const write = existing!;
-      log("info", "FILE", `Already have "${meta.fileName}" complete — telling the host to skip re-sending it.`);
-      roomRef.current?.sendFileResume(meta.mediaId, [[0, write.totalChunks - 1]]);
-      return {
-        alreadyReceivedCount: write.totalChunks,
-        onChunk: () => { /* host shouldn't send anything, but ignore harmlessly if it does */ },
-        onEnd: () => { /* already finalized */ },
-        onAbort: () => { /* nothing in flight to abort */ }
-      };
-    }
-
-    const isResume = isSameMedia && !existing!.finalized;
-
-    let write: ActiveFileWrite;
-
-    if (isResume) {
-      write = existing!;
-      setGuestStreamMeta(meta);
-      log(
-        "info",
-        "FILE",
-        `Resuming "${meta.fileName}" — already have ${write.receivedIndices.size}/${meta.totalChunks} chunks, requesting the rest.`
-      );
-    } else {
-      cleanupOpfsFile();
-      setGuestStreamUrl((previousUrl) => {
-        if (previousUrl) {
-          staleBlobUrlRef.current = previousUrl;
-        }
-        return null;
-      });
-      setGuestStreamMeta(meta);
-      log("info", "FILE", `Receiving "${meta.fileName}" (${(meta.fileSize / 1024 / 1024).toFixed(1)} MB) to local disk...`);
-
-      const opfsFileName = `syncplayer-transfer-${meta.mediaId}`;
-      write = {
-        mediaId: meta.mediaId,
-        fileName: meta.fileName,
-        totalChunks: meta.totalChunks,
-        kind: inferMediaKind(meta.mimeType || meta.fileName),
-        format: meta.format,
-        opfsFileName,
-        opfsFileHandle: null,
-        writableStream: null,
-        writeQueue: Promise.resolve(),
-        receivedIndices: new Set(),
-        chunkChecksums: new Map(),
-        pendingHostChecksum: null,
-        endReceived: false,
-        finalized: false,
-        aborted: false
-      };
-      activeFileWriteRef.current = write;
-
-      write.writeQueue = write.writeQueue.then(async () => {
-        try {
-          const root = await navigator.storage.getDirectory();
-          const handle = await root.getFileHandle(opfsFileName, { create: true });
-          write.opfsFileHandle = handle;
-          write.writableStream = await handle.createWritable();
-        } catch (err) {
-          log("error", "FILE", `Failed to initialize OPFS storage: ${err instanceof Error ? err.message : String(err)}`);
-          write.aborted = true;
-        }
-      });
-    }
-
-    // Tell the host what we already have (empty ranges for a fresh transfer,
-    // in which case this just lets the host proceed without waiting out its
-    // full resume-ack timeout).
-    roomRef.current?.sendFileResume(meta.mediaId, indicesToRanges(write.receivedIndices));
-
-    const finalizeFile = () => {
-      if (write.finalized || write.aborted) return;
-      write.finalized = true;
-
-      write.writeQueue = write.writeQueue.then(async () => {
-        if (!write.writableStream || !write.opfsFileHandle) return;
-        try {
-          const combined = combineChecksums(write.chunkChecksums, write.totalChunks);
-          if (write.pendingHostChecksum && combined !== write.pendingHostChecksum) {
-            log(
-              "warn",
-              "FILE",
-              `Integrity check mismatch for "${write.fileName}" — the received chunk set doesn't match what the host sent. Playback may have gaps.`
-            );
-          } else {
-            log("ok", "FILE", `Integrity check passed for "${write.fileName}".`);
-          }
-
-          await write.writableStream.close();
-          const file = await write.opfsFileHandle.getFile();
-          guestFileRef.current = file;
-          opfsFileHandleRef.current = write.opfsFileHandle;
-          opfsFileNameRef.current = write.opfsFileName;
-          const url = URL.createObjectURL(file);
-
-          setGuestStreamUrl(url);
-          setMedia({
-            id: write.mediaId,
-            title: write.fileName,
-            sourceUrl: url,
-            kind: write.kind,
-            format: write.format,
-            origin: "local-file",
-            sizeBytes: file.size
-          });
-          setGuestStreamMeta(null);
-          log("ok", "FILE", `"${write.fileName}" completely downloaded and mounted for playback.`);
-        } catch (err) {
-          log("error", "FILE", `Failed to finalize file transfer: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      });
-    };
-
-    return {
-      alreadyReceivedCount: write.receivedIndices.size,
-      onChunk: (index, _total, data, checksum) => {
-        if (write.aborted || write.finalized || write.receivedIndices.has(index)) return;
-
-        write.writeQueue = write.writeQueue.then(async () => {
-          if (!write.writableStream || write.aborted || write.finalized) return;
-          try {
-            await write.writableStream.write({
-              type: "write",
-              position: index * CHUNK_SIZE,
-              data: data.buffer as ArrayBuffer
-            });
-          } catch (err) {
-            log("error", "FILE", `Failed to write chunk ${index}: ${err instanceof Error ? err.message : String(err)}`);
-            write.aborted = true;
-            return;
-          }
-
-          write.receivedIndices.add(index);
-          write.chunkChecksums.set(index, checksum);
-
-          if (write.endReceived && write.receivedIndices.size >= write.totalChunks) {
-            finalizeFile();
-          }
-        });
-      },
-      onEnd: (checksum) => {
-        if (write.aborted) return;
-        write.pendingHostChecksum = checksum || null;
-        if (write.receivedIndices.size >= write.totalChunks) {
-          finalizeFile();
-        } else {
-          write.endReceived = true;
-        }
-      },
-      onAbort: (reason) => {
-        if (write.aborted || write.finalized) return;
-        write.aborted = true;
-        setGuestStreamMeta(null);
-        log(
-          "error",
-          "FILE",
-          `Transfer of "${write.fileName}" aborted by host${reason ? `: ${reason}` : "."} You'll need to wait for the host to retry.`
-        );
-      }
-    };
-  }, [cleanupOpfsFile, log]);
+  const handleFileStream = useMemo(
+    () =>
+      createFileReceiver({
+        log,
+        cleanupOpfsFile,
+        roomRef,
+        activeFileWriteRef,
+        opfsFileHandleRef,
+        opfsFileNameRef,
+        guestFileRef,
+        staleBlobUrlRef,
+        setGuestStreamMeta,
+        setGuestStreamUrl,
+        setMedia
+      }),
+    [cleanupOpfsFile, log]
+  );
 
   const mountRemoteMedia = useCallback(
     (url: string, source: "manual" | "invite") => {
@@ -991,6 +758,20 @@ export function App() {
     [log]
   );
 
+  // Host-side: a viewer verified its download and wants the gaps filled. The viewer's file.resume
+  // reply (triggered by the file.meta this sends) tells sendFile which chunks to skip.
+  const handleFileRetry = useCallback(
+    (mediaId: string, peerId: string) => {
+      const file = hostFileRef.current;
+      if (!file || mediaStateRef.current?.id !== mediaId) {
+        log("warn", "FILE", `${peerId} asked for a re-send of ${mediaId}, but that file is no longer being shared.`);
+        return;
+      }
+      void roomRef.current?.sendFile(file, mediaId, { targetPeerIds: [peerId], background: true });
+    },
+    [log]
+  );
+
   const room = usePeerRoom({
     onPlaybackState: handleRemotePlayback,
     onEvent: log,
@@ -1000,6 +781,7 @@ export function App() {
     onConfigState: handleConfigState,
     onConfigChanged: handleConfigChanged,
     onGuestAction: handleGuestAction,
+    onFileRetry: handleFileRetry,
     allowAllConnections
   });
 
@@ -1267,13 +1049,29 @@ export function App() {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectCountRef = useRef(0);
 
+  const [reconnectGaveUp, setReconnectGaveUp] = useState(false);
+
   useEffect(() => {
-    if (room.role !== "guest") return;
-    if (room.status !== "disconnected" && room.status !== "failed") {
+    if (room.role !== "guest") {
       reconnectCountRef.current = 0;
+      setReconnectGaveUp(false);
       return;
     }
+    // Only a real connection resets the budget — "pairing" between attempts must not,
+    // or the backoff would restart (and never give up) on every failed try.
+    if (room.status === "connected") {
+      reconnectCountRef.current = 0;
+      setReconnectGaveUp(false);
+      return;
+    }
+    if (room.status !== "disconnected" && room.status !== "failed") return;
     if (!room.localOffer) return;
+
+    if (reconnectCountRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      setReconnectGaveUp(true);
+      log("error", "GUEST", `Gave up reconnecting after ${MAX_RECONNECT_ATTEMPTS} attempts. Use "Retry Connection" once the host is back.`);
+      return;
+    }
 
     const delay = Math.min(2000 * Math.pow(2, reconnectCountRef.current), 16000);
     reconnectCountRef.current += 1;
@@ -2036,7 +1834,7 @@ export function App() {
             </button>
           </div>
         </div>
-      ) : room.role === "guest" && room.status === "failed" ? (
+      ) : room.role === "guest" && (room.status === "failed" || (room.status === "disconnected" && reconnectGaveUp)) ? (
         <div className="status-band status-band--error">
           <div className="status-band__content">
             <div className="status-band__icon">
@@ -2045,7 +1843,7 @@ export function App() {
             <div className="status-band__text-group">
               <span className="status-band__title">Connection Failed</span>
               <span className="status-band__desc">
-                Could not connect to Host room <strong>{formatRoomId(room.localOffer)}</strong>. Check the Activity Log below for details.
+                {reconnectGaveUp ? "Lost the connection to" : "Could not connect to"} Host room <strong>{formatRoomId(room.localOffer)}</strong>. Check the Activity Log below for details.
               </span>
             </div>
           </div>
@@ -2238,7 +2036,7 @@ export function App() {
                         const label = peer.startsWith("SP-GUEST") ? `Viewer (${peer.slice(9)})` : `Peer ${idx + 1}`;
 
                         return (
-                          <div className="upload-lock-viewer-row" key={peer}>
+                          <div className={cx("upload-lock-viewer-row", percent < 100 && "upload-lock-viewer-row--active")} key={peer}>
                             <span className="upload-lock-viewer-row__label">{label}</span>
                             <div className="upload-lock-viewer-row__bar">
                               <div className="upload-lock-viewer-row__fill" style={{ width: `${percent}%` }} />
