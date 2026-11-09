@@ -198,6 +198,9 @@ function describeMediaErrorCode(code: number): string {
 // Auto-reconnect attempts (2s, 4s, 8s, 16s, 16s, 16s) before handing control back to the viewer.
 const MAX_RECONNECT_ATTEMPTS = 6;
 
+const LOCAL_FILE_UNPLAYABLE_HINT =
+  "This browser can't play this file. It may be damaged, or use a format the browser doesn't support (MKV, AVI and HEVC/H.265 video often aren't). Converting it to MP4 (H.264 video, AAC audio) usually fixes it.";
+
 const NO_SOURCE_HINT =
   "No data was received from the server at all. This is almost always the server refusing the request — common causes are " +
   "hotlink/Referer protection (many streaming and file-lock CDNs only allow their own site to embed the link), a link that " +
@@ -414,6 +417,11 @@ export function App() {
   // Friendly, user-facing explanation shown over the player when the current
   // media source fails to load (as opposed to the raw technical log entry).
   const [playerLoadError, setPlayerLoadError] = useState<string | null>(null);
+  // Which media id we already tried to recover a dead blob URL for (at most once each).
+  const blobRecoveryMediaIdRef = useRef<string | null>(null);
+  // Viewer chose to see the player despite the load error.
+  const [showPlayerAnyway, setShowPlayerAnyway] = useState(false);
+  useEffect(() => setShowPlayerAnyway(false), [playerLoadError]);
   // Throttles repeated identical error reports (e.g. a player's own internal
   // retry loop hitting the same failure every second) into one log entry
   // plus a "repeated Nx" summary, instead of spamming the activity log.
@@ -443,6 +451,21 @@ export function App() {
       if (!element) return;
 
       const mediaError = element.error;
+      const isNoSource = element.networkState === 3 && element.readyState === 0 && !mediaError;
+      // A local or received file (blob: URL) never involves a server, so the URL/hotlink
+      // advice is wrong there: it's the file itself the browser can't play.
+      const isLocalFile = mediaStateRef.current?.sourceUrl.startsWith("blob:") ?? false;
+      const friendlyMessage = isLocalFile && (isNoSource || mediaError?.code === 3 || mediaError?.code === 4)
+        ? LOCAL_FILE_UNPLAYABLE_HINT
+        : isNoSource
+        ? NO_SOURCE_HINT
+        : mediaError
+          ? describeMediaErrorCode(mediaError.code)
+          : "The media failed to load for an unknown reason.";
+
+      setPlayerLoadError(friendlyMessage);
+
+      // Always show the banner; only the activity-log entry is throttled.
       const signature = `${element.readyState}-${element.networkState}-${mediaError?.code ?? "none"}`;
       const now = performance.now();
       const last = lastPlayerErrorRef.current;
@@ -459,14 +482,6 @@ export function App() {
 
       lastPlayerErrorRef.current = { signature, at: now, count: 1 };
 
-      const isNoSource = element.networkState === 3 && element.readyState === 0 && !mediaError;
-      const friendlyMessage = isNoSource
-        ? NO_SOURCE_HINT
-        : mediaError
-          ? describeMediaErrorCode(mediaError.code)
-          : "The media failed to load for an unknown reason.";
-
-      setPlayerLoadError(friendlyMessage);
       log(
         "error",
         sourceLabel,
@@ -1469,6 +1484,10 @@ export function App() {
     const streamType =
       media.format === "hls" ? "m3u8" : media.format === "dash" ? "mpd" : null;
 
+    // ArtPlayer retries failed loads itself ("Reconnect: N"). That helps flaky network URLs,
+    // but a local/received file (blob:) that fails will fail every time — go straight to the banner.
+    Artplayer.RECONNECT_TIME_MAX = media.sourceUrl.startsWith("blob:") ? 0 : 5;
+
     const art = new Artplayer({
       container,
       url: media.sourceUrl,
@@ -1561,7 +1580,7 @@ export function App() {
 
     artRef.current = art;
 
-    art.on("error", (error: unknown, detail?: unknown) => {
+    const onArtError = (error: unknown, detail?: unknown) => {
       const ctx: Record<string, unknown> = { src: media.sourceUrl, format: media.format };
       if (error instanceof Event && error.target) {
         const video = error.target as HTMLVideoElement;
@@ -1582,7 +1601,10 @@ export function App() {
 
       // Recover dead blob URLs by regenerating from the persisted OPFS file handle.
       // The handle stays alive in a ref, so getFile() returns a fresh lazy File.
-      if (media.sourceUrl.startsWith("blob:") && opfsFileHandleRef.current) {
+      // Only once per media: if a fresh URL fails too, the file itself is the problem, and
+      // retrying would just rebuild the player forever.
+      if (media.sourceUrl.startsWith("blob:") && opfsFileHandleRef.current && blobRecoveryMediaIdRef.current !== media.id) {
+        blobRecoveryMediaIdRef.current = media.id;
         log("warn", "PLAYER", "Blob URL appears dead, regenerating from OPFS file handle...");
         opfsFileHandleRef.current.getFile().then((file) => {
           const newUrl = URL.createObjectURL(file);
@@ -1593,7 +1615,13 @@ export function App() {
           log("error", "PLAYER", "Failed to regenerate blob URL from OPFS handle.");
         });
       }
-    });
+    };
+    art.on("error", onArtError);
+    // With ArtPlayer's retries off (blob: sources, see above) it no longer reports the
+    // failure itself, so listen on the <video> element directly.
+    if (media.sourceUrl.startsWith("blob:")) {
+      art.video.addEventListener("error", onArtError);
+    }
 
     art.on("fullscreen", (state) => {
       if (state) {
@@ -1968,7 +1996,7 @@ export function App() {
           </div>
 
           <Panel title="Playback Surface" icon={<Video size={15} />} className="player-panel">
-            <div className="player-shell">
+            <div className={cx("player-shell", playerLoadError && !showPlayerAnyway && "player-shell--error")}>
               {media ? (
                 media.kind === "audio" ? (
                   <div className="audio-stage">
@@ -2057,13 +2085,17 @@ export function App() {
               {/* Shown when the current source fails to load — surfaced here
                   instead of only in the activity log, since a failed load
                   otherwise just looks like an empty/frozen player. */}
-              {playerLoadError && (
-                <div className="media-load-error-overlay">
-                  <AlertTriangle size={36} />
-                  <strong>Playback Failed</strong>
-                  <span>{playerLoadError}</span>
-                  <button type="button" onClick={() => setPlayerLoadError(null)}>
-                    Dismiss
+              {playerLoadError && !showPlayerAnyway && (
+                <div className="media-load-error-overlay" role="alert">
+                  <div className="media-load-error-banner">
+                    <AlertTriangle size={28} />
+                    <div>
+                      <strong>Can't play {media?.title ? `"${media.title}"` : "this media"}</strong>
+                      <span>{playerLoadError}</span>
+                    </div>
+                  </div>
+                  <button type="button" onClick={() => setShowPlayerAnyway(true)}>
+                    Show player anyway
                   </button>
                 </div>
               )}
